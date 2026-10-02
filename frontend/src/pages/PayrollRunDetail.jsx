@@ -127,15 +127,55 @@ export default function PayrollRunDetail() {
                           <div>
                             <b style={{ fontSize: 12.5 }}>Earnings</b>
                             {it.earnings.map((e) => <div className="spread" key={e.code}><span style={{ fontSize: 12.5 }}>{e.name}</span><span style={{ fontSize: 12.5 }}>{money2(e.amount)}</span></div>)}
+                            <div className="spread" style={{ borderTop: '1px solid var(--border)', marginTop: 4, paddingTop: 4 }}><span style={{ fontSize: 12.5, fontWeight: 600 }}>Gross</span><span style={{ fontSize: 12.5, fontWeight: 600 }}>{money2(it.gross)}</span></div>
                           </div>
                           <div>
                             <b style={{ fontSize: 12.5 }}>Deductions</b>
                             {it.deductions.length ? it.deductions.map((e) => <div className="spread" key={e.code}><span style={{ fontSize: 12.5 }}>{e.name}</span><span style={{ fontSize: 12.5 }}>{money2(e.amount)}</span></div>) : <Empty text="None" />}
+                            <div className="spread" style={{ borderTop: '1px solid var(--border)', marginTop: 4, paddingTop: 4 }}><span style={{ fontSize: 12.5, fontWeight: 600 }}>Total</span><span style={{ fontSize: 12.5, fontWeight: 600 }}>{money2(it.total_deductions)}</span></div>
                           </div>
                           <div>
                             <b style={{ fontSize: 12.5 }}>Employer contributions</b>
                             {it.employer_contrib.length ? it.employer_contrib.map((e) => <div className="spread" key={e.code}><span style={{ fontSize: 12.5 }}>{e.name}</span><span style={{ fontSize: 12.5 }}>{money2(e.amount)}</span></div>) : <Empty text="None" />}
                           </div>
+                        </div>
+
+                        {(it.reimbursements?.length > 0 || it.adjustments?.length > 0) && (
+                          <div className="grid c2" style={{ marginTop: 12 }}>
+                            <div>
+                              <b style={{ fontSize: 12.5 }}>Reimbursements <span style={{ fontWeight: 400, color: 'var(--muted)' }}>(non-taxable, outside gross)</span></b>
+                              {it.reimbursements?.length ? it.reimbursements.map((r) => (
+                                <div className="spread" key={r.code}><span style={{ fontSize: 12.5 }}>{r.name}</span><span style={{ fontSize: 12.5 }}>{money2(r.amount)}</span></div>
+                              )) : <Empty text="None" />}
+                              {it.reimbursements?.length > 0 && (
+                                <div className="spread" style={{ borderTop: '1px solid var(--border)', marginTop: 4, paddingTop: 4 }}><span style={{ fontSize: 12.5, fontWeight: 600 }}>Subtotal</span><span style={{ fontSize: 12.5, fontWeight: 600 }}>{money2(it.reimbursements_total)}</span></div>
+                              )}
+                            </div>
+                            <div>
+                              <b style={{ fontSize: 12.5 }}>One-time adjustments</b>
+                              {it.adjustments?.length ? it.adjustments.map((a) => (
+                                <div className="spread" key={a.adjustmentId || a.code}>
+                                  <span style={{ fontSize: 12.5 }}>
+                                    {a.name}
+                                    {a.forPeriod && <span style={{ color: 'var(--muted)' }}> · for {a.forPeriod}</span>}
+                                  </span>
+                                  <span style={{ fontSize: 12.5, color: a.direction === 'deduction' ? 'var(--red)' : 'var(--green)' }}>
+                                    {a.direction === 'deduction' ? '−' : '+'}{money2(a.amount)}
+                                  </span>
+                                </div>
+                              )) : <Empty text="None" />}
+                              {it.adjustments?.length > 0 && (
+                                <div className="spread" style={{ borderTop: '1px solid var(--border)', marginTop: 4, paddingTop: 4 }}><span style={{ fontSize: 12.5, fontWeight: 600 }}>Net</span><span style={{ fontSize: 12.5, fontWeight: 600 }}>{money2(it.adjustments_total)}</span></div>
+                              )}
+                            </div>
+                          </div>
+                        )}
+
+                        <div style={{ marginTop: 12, paddingTop: 8, borderTop: '1px solid var(--border)', fontSize: 12.5, color: 'var(--muted)' }}>
+                          Gross {money2(it.gross)}
+                          {(it.reimbursements_total > 0) && <> + reimbursements {money2(it.reimbursements_total)}</>}
+                          {(it.adjustments_total !== 0) && <> {it.adjustments_total >= 0 ? '+' : '−'} adjustments {money2(Math.abs(it.adjustments_total))}</>}
+                          {' '}− deductions {money2(it.total_deductions)} = <b style={{ color: 'var(--green)' }}>{money2(it.net_pay)}</b>
                         </div>
                       </td>
                     </tr>

@@ -193,12 +193,12 @@ export default function Settings() {
 
       {tab === 'audit' && audit && (
         <div className="card">
-          <div className="card-h"><h3>Audit trail ({audit.meta?.total ?? audit.length})</h3></div>
+          <div className="card-h"><h3>Audit trail ({audit.meta?.total ?? audit.data?.length ?? 0})</h3></div>
           <div className="table-wrap" style={{ maxHeight: 520, overflow: 'auto' }}>
             <table className="tbl">
               <thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Entity</th><th>IP</th></tr></thead>
               <tbody>
-                {audit.data.map((a) => (
+                {(audit.data || []).map((a) => (
                   <tr key={a.id}>
                     <td style={{ whiteSpace: 'nowrap' }}>{fmtDate(a.created_at, true)}</td>
                     <td>{a.actor_name} <span style={{ color: 'var(--muted)', fontSize: 11.5 }}>({a.actor_role?.replace(/_/g, ' ')})</span></td>

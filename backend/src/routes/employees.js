@@ -8,6 +8,7 @@ const { authenticate, requirePermission, employeeScopeCondition, scopeFor } = re
 const { encrypt, decrypt, maskPan, maskAadhaar, maskBank } = require('../utils/crypto');
 const { logAudit } = require('../services/audit');
 const { notifyEvent } = require('../services/notify');
+const { emitEvent } = require('../services/webhooks');
 const { upload, relPath } = require('../middleware/upload');
 const { parseCsv, toCsv } = require('../utils/csv');
 
@@ -141,6 +142,7 @@ r.post('/', requirePermission('employee.create'), asyncH(async (req, res) => {
     );
   }
   await logAudit({ tenantId: req.user.tenant_id, actor: req.user, action: 'employee.create', entityType: 'employee', entityId: ins.insertId, after: { code, email: data.email, status }, req });
+  await emitEvent({ tenantId: req.user.tenant_id, eventType: 'employee.created', payload: { employeeId: ins.insertId, code, email: data.email, status } });
   const [rows] = await pool.query('SELECT id, employee_code, first_name, last_name, email, status FROM employees WHERE id = ?', [ins.insertId]);
   res.status(201).json({ data: rows[0], tempPassword, portalCreated: !!tempPassword });
 }));

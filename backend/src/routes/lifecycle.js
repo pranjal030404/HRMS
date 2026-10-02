@@ -1,10 +1,12 @@
 const express = require('express');
 const dayjs = require('dayjs');
 const { pool } = require('../config/db');
-const { asyncH, HttpError } = require('../utils/helpers');
+const { asyncH, HttpError, round2 } = require('../utils/helpers');
 const { authenticate, requirePermission, employeeScopeCondition } = require('../middleware/auth');
 const { logAudit } = require('../services/audit');
+const { createAdjustment } = require('../services/payroll');
 const { notifyEvent } = require('../services/notify');
+const { emitEvent } = require('../services/webhooks');
 
 const r = express.Router();
 r.use(authenticate);
@@ -149,27 +151,117 @@ r.post('/separations/:id/clearance/:department', requirePermission('separation.m
 
 // Full & Final
 r.get('/separations/:id/fnf', requirePermission('separation.view'), asyncH(async (req, res) => {
-  const [items] = await pool.query('SELECT * FROM fnf_items WHERE separation_id = ? ORDER BY id', [req.params.id]);
   const [seps] = await pool.query('SELECT * FROM separations WHERE id = ? AND tenant_id = ?', [req.params.id, req.user.tenant_id]);
   if (!seps[0]) throw new HttpError(404, 'Not found');
+  const [items] = await pool.query(
+    `SELECT f.*, a.id AS adjustment_id, a.status AS adjustment_status, a.applied_run_id
+     FROM fnf_items f
+     LEFT JOIN payroll_adjustments a
+       ON a.tenant_id = f.tenant_id AND a.source_type = 'fnf' AND a.source_id = f.id
+     WHERE f.separation_id = ? AND f.tenant_id = ? ORDER BY f.id`,
+    [req.params.id, req.user.tenant_id]
+  );
   res.json({ data: items, separation: seps[0], total: items.reduce((s, i) => s + (i.ftype === 'payment' ? Number(i.amount) : -Number(i.amount)), 0) });
 }));
 
 r.post('/separations/:id/fnf', requirePermission('separation.manage'), asyncH(async (req, res) => {
   const { component, ftype, amount, remarks } = req.body || {};
   if (!component || !amount) throw new HttpError(400, 'component and amount required');
-  await pool.query('INSERT INTO fnf_items (separation_id, component, ftype, amount, remarks) VALUES (?,?,?,?,?)', [req.params.id, component, ftype || 'payment', amount, remarks || null]);
-  await pool.query('UPDATE separations SET fnf_status = "calculated" WHERE id = ?', [req.params.id]);
-  res.status(201).json({ ok: true });
+  const [seps] = await pool.query('SELECT * FROM separations WHERE id = ? AND tenant_id = ?', [req.params.id, req.user.tenant_id]);
+  if (!seps[0]) throw new HttpError(404, 'Separation not found');
+  if (!(Number(amount) !== 0)) throw new HttpError(400, 'amount cannot be zero');
+  const [ins] = await pool.query(
+    'INSERT INTO fnf_items (tenant_id, separation_id, component, ftype, amount, remarks) VALUES (?,?,?,?,?,?)',
+    [req.user.tenant_id, req.params.id, component, ftype || 'payment', amount, remarks || null]
+  );
+  await pool.query('UPDATE separations SET fnf_status = "calculated" WHERE id = ? AND tenant_id = ?', [req.params.id, req.user.tenant_id]);
+  await logAudit({ tenantId: req.user.tenant_id, actor: req.user, action: 'separation.fnf_item_add', entityType: 'fnf_item', entityId: ins.insertId, after: { component, ftype, amount }, req });
+  res.status(201).json({ data: { id: ins.insertId } });
 }));
 
+/**
+ * Push every F&F line into payroll as an approved adjustment so it is paid by the next run.
+ * Idempotent per line (source_type='fnf', source_id=fnf_item.id) — re-running never double-pays.
+ * The separation cannot be completed until a locked run has actually paid these lines.
+ */
+r.post('/separations/:id/fnf/disburse', requirePermission('separation.manage'), asyncH(async (req, res) => {
+  const [seps] = await pool.query('SELECT * FROM separations WHERE id = ? AND tenant_id = ?', [req.params.id, req.user.tenant_id]);
+  const sep = seps[0];
+  if (!sep) throw new HttpError(404, 'Separation not found');
+  if (sep.status === 'completed') throw new HttpError(409, 'This separation is already completed');
+  if (sep.fnf_status !== 'calculated') throw new HttpError(409, 'Calculate the F&F statement before disbursing');
+
+  const [pending] = await pool.query(
+    "SELECT COUNT(*) AS n FROM clearances WHERE separation_id = ? AND status <> 'cleared'", [sep.id]
+  );
+  if (pending[0].n > 0 && !req.body?.overrideClearances) {
+    throw new HttpError(409, `${pending[0].n} clearance(s) are still pending — clear them first or pass overrideClearances`);
+  }
+
+  const [items] = await pool.query(
+    'SELECT * FROM fnf_items WHERE separation_id = ? AND tenant_id = ? ORDER BY id', [sep.id, req.user.tenant_id]
+  );
+  if (!items.length) throw new HttpError(400, 'No F&F lines to disburse');
+
+  const raised = [];
+  for (const it of items) {
+    const adj = await createAdjustment(req.user.tenant_id, req.user, {
+      employeeId: sep.employee_id,
+      atype: 'fnf',
+      direction: it.ftype === 'recovery' ? 'deduction' : 'earning',
+      component: it.component,
+      description: `Full & Final — ${sep.sep_type}${sep.last_working_day ? ` (LWD ${sep.last_working_day})` : ''}`,
+      amount: Math.abs(Number(it.amount)),
+      originalRunId: null,
+      sourceType: 'fnf',
+      sourceId: it.id,
+      reason: it.remarks || `F&F line #${it.id} for separation #${sep.id}`,
+      autoApprove: true,
+    });
+    raised.push({ fnfItemId: it.id, component: it.component, adjustmentId: adj.id, status: adj.status, reused: !!adj.reused });
+  }
+
+  await logAudit({
+    tenantId: req.user.tenant_id, actor: req.user, action: 'separation.fnf_disburse',
+    entityType: 'separation', entityId: sep.id, after: { adjustments: raised }, req,
+  });
+  res.json({
+    data: raised,
+    totals: {
+      lines: raised.length,
+      payments: round2(items.filter((i) => i.ftype === 'payment').reduce((s, i) => s + Math.abs(Number(i.amount)), 0)),
+      recoveries: round2(items.filter((i) => i.ftype === 'recovery').reduce((s, i) => s + Math.abs(Number(i.amount)), 0)),
+    },
+  });
+}));
+
+/** Completion is gated on payroll actually having paid the F&F lines. */
 r.post('/separations/:id/complete', requirePermission('separation.manage'), asyncH(async (req, res) => {
   const [seps] = await pool.query('SELECT * FROM separations WHERE id = ? AND tenant_id = ?', [req.params.id, req.user.tenant_id]);
   const sep = seps[0];
   if (!sep) throw new HttpError(404, 'Not found');
-  await pool.query('UPDATE separations SET status = "completed", fnf_status = "paid" WHERE id = ?', [sep.id]);
+  if (sep.status === 'completed') throw new HttpError(409, 'This separation is already completed');
+  const [adj] = await pool.query(
+    `SELECT COUNT(*) AS total, SUM(applied_run_id IS NOT NULL) AS paid
+     FROM payroll_adjustments
+     WHERE tenant_id = ? AND source_type = 'fnf' AND employee_id = ?
+       AND source_id IN (SELECT id FROM fnf_items WHERE separation_id = ? AND tenant_id = ?)`,
+    [req.user.tenant_id, sep.employee_id, sep.id, req.user.tenant_id]
+  );
+  const total = Number(adj[0].total || 0);
+  const paid = Number(adj[0].paid || 0);
+  if (total === 0) throw new HttpError(409, 'Disburse the F&F statement into payroll before completing this separation');
+  if (paid < total) throw new HttpError(409, `${total - paid} F&F line(s) have not been paid in a locked payroll run yet`);
+
+  await pool.query('UPDATE separations SET status = "completed", fnf_status = "paid" WHERE id = ? AND tenant_id = ?', [sep.id, req.user.tenant_id]);
   await pool.query('UPDATE employees SET status = "exited" WHERE id = ?', [sep.employee_id]);
   await pool.query('UPDATE users SET status = "disabled" WHERE employee_id = ?', [sep.employee_id]);
+  // notify integrations (e.g. standalone LMS suspends the learner)
+  const [emp] = await pool.query('SELECT external_employee_id, employee_code, email FROM employees WHERE id = ?', [sep.employee_id]);
+  await emitEvent({
+    tenantId: req.user.tenant_id, eventType: 'employee.exited',
+    payload: { employeeId: sep.employee_id, externalEmployeeId: emp[0]?.external_employee_id || emp[0]?.employee_code, email: emp[0]?.email, exitDate: sep.last_working_day, rehireEligible: sep.rehire_eligible ?? null },
+  });
   await logAudit({ tenantId: req.user.tenant_id, actor: req.user, action: 'separation.complete', entityType: 'separation', entityId: sep.id, req });
   res.json({ ok: true });
 }));

@@ -33,13 +33,8 @@ r.post('/tenants', asyncH(async (req, res) => {
     );
     const tenantId = ins.insertId;
     // seed roles from system defaults
-    const { ROLE_DEFS, DEFAULT_ROLES } = require('../utils/permissions');
-    for (const key of DEFAULT_ROLES) {
-      await pool.query(
-        'INSERT INTO roles (tenant_id, name, label, permissions, is_system) VALUES (?,?,?,?,1)',
-        [tenantId, key, ROLE_DEFS[key].label, JSON.stringify(ROLE_DEFS[key].permissions)]
-      );
-    }
+    const rbac = require('../services/rbac');
+    await rbac.provisionTenantRoles(tenantId);
     // company owner user
     const [uIns] = await pool.query(
       `INSERT INTO users (tenant_id, email, password_hash, name, role, status, must_change_password) VALUES (?,?,?,?,?,'active',1)`,

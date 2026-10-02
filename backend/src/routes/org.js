@@ -32,6 +32,18 @@ r.use('/cost-centers', crudRouter({
   table: 'cost_centers', perm: 'org.manage', fields: ['name', 'code', 'status'],
   required: ['name'], searchable: ['name', 'code'],
 }));
+r.use('/legal-entities', crudRouter({
+  table: 'legal_entities', perm: 'org.manage', fields: ['name', 'code', 'entity_type', 'cin', 'pan', 'gstin', 'address', 'city', 'state', 'status'],
+  required: ['name'], searchable: ['name', 'code', 'gstin'],
+}));
+r.use('/business-units', crudRouter({
+  table: 'business_units', perm: 'org.manage', fields: ['name', 'code', 'head_employee_id', 'parent_id', 'status'],
+  required: ['name'], searchable: ['name', 'code'], numericFields: ['head_employee_id', 'parent_id'],
+}));
+r.use('/job-levels', crudRouter({
+  table: 'job_levels', perm: 'org.manage', fields: ['name', 'level', 'description', 'status'],
+  required: ['name'], searchable: ['name'], numericFields: ['level'],
+}));
 r.use('/shifts', crudRouter({
   table: 'shifts', perm: 'org.manage', fields: ['name', 'code', 'start_time', 'end_time', 'grace_minutes', 'half_day_hours', 'full_day_hours', 'break_minutes', 'weekly_offs', 'cross_midnight', 'overtime_enabled', 'min_overtime_minutes', 'status'],
   required: ['name'], searchable: ['name'], numericFields: ['grace_minutes', 'break_minutes', 'min_overtime_minutes'],
@@ -95,7 +107,10 @@ r.get('/lookups', asyncH(async (req, res) => {
   const [costCenters] = await pool.query('SELECT id, name FROM cost_centers WHERE tenant_id = ? AND status = "active"', [t]);
   const [leaveTypes] = await pool.query('SELECT id, name, code, unit, is_paid FROM leave_types WHERE tenant_id = ? AND active = 1', [t]);
   const [expenseCategories] = await pool.query('SELECT id, name FROM expense_categories WHERE tenant_id = ? AND active = 1', [t]);
-  res.json({ data: { departments, designations, grades, locations, shifts, costCenters, leaveTypes, expenseCategories } });
+  const [legalEntities] = await pool.query('SELECT id, name FROM legal_entities WHERE tenant_id = ? AND status = "active"', [t]);
+  const [businessUnits] = await pool.query('SELECT id, name FROM business_units WHERE tenant_id = ? AND status = "active"', [t]);
+  const [jobLevels] = await pool.query('SELECT id, name, level FROM job_levels WHERE tenant_id = ? AND status = "active"', [t]);
+  res.json({ data: { departments, designations, grades, locations, shifts, costCenters, leaveTypes, expenseCategories, legalEntities, businessUnits, jobLevels } });
 }));
 
 module.exports = r;

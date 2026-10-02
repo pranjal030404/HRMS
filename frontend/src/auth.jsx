@@ -40,6 +40,14 @@ export function AuthProvider({ children }) {
 
   const login = async (email, password) => {
     const { data } = await api.post('/auth/login', { email, password });
+    if (data.mfaRequired) return data; // caller completes via completeMfaLogin
+    setToken(data.accessToken);
+    await refreshMe();
+    return data;
+  };
+
+  const completeMfaLogin = async (challenge, code) => {
+    const { data } = await api.post('/auth/mfa/verify', { challenge, code });
     setToken(data.accessToken);
     await refreshMe();
     return data;
@@ -61,8 +69,22 @@ export function AuthProvider({ children }) {
     return me.permissions.some((p) => p === base || p.startsWith(base + ':'));
   };
 
+  // Switching a module off in the Administration Center detaches its routes on the
+  // server (`app.use('/api/travel', requireModuleEnabled('travel'), …)`), so the UI
+  // has to gate on it as well — a permission alone would still show the menu entry
+  // and every visit would come back 403. `accessibleModules` is resolved by the
+  // same resolver the API uses, so the two can never disagree.
+  const moduleOn = (key) => {
+    if (!me) return false;
+    if (me.role === 'platform_super_admin') return true;
+    if (!key) return true;
+    const list = me.accessibleModules;
+    if (!Array.isArray(list)) return true; // no answer to check against — let the API decide
+    return list.includes(key);
+  };
+
   return (
-    <Ctx.Provider value={{ me, loading, login, logout, can, refreshMe }}>
+    <Ctx.Provider value={{ me, loading, login, completeMfaLogin, logout, can, moduleOn, refreshMe }}>
       {children}
     </Ctx.Provider>
   );

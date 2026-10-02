@@ -4,6 +4,9 @@ const { pool } = require('../config/db');
 const { asyncH, HttpError, fyLabel } = require('../utils/helpers');
 const { authenticate, requirePermission, scopeFor } = require('../middleware/auth');
 const { getSetting, setSetting } = require('../services/settings');
+const { logAudit } = require('../services/audit');
+const statutory = require('../services/statutoryReturns');
+const { round2 } = require('../utils/helpers');
 const { toCsv } = require('../utils/csv');
 const { ROLE_DEFS } = require('../utils/permissions');
 const { invalidateRoleCache } = require('../middleware/auth');
@@ -36,6 +39,11 @@ const REPORTS = {
   'payroll-register': 'Payroll register',
   'payroll-variance': 'Payroll month-over-month variance',
   'statutory-summary': 'Statutory contributions summary',
+  'statutory-pf-ecr': 'PF — ECR / Challan cum Return (ECR sheet)',
+  'statutory-esi': 'ESI — Employee & Employer Contribution Return',
+  'statutory-pt': 'Professional Tax — state-wise collection summary',
+  'statutory-tds': 'TDS on Salary — deposits & annual reconciliation',
+  'payroll-reconciliation': 'Bank reconciliation vs payroll net (by run)',
   'expense-register': 'Expense register',
   'loan-register': 'Loan & advance register',
   'invoice-register': 'Invoice register',
@@ -189,6 +197,60 @@ r.get('/data', requirePermission('report.view'), asyncH(async (req, res) => {
       [rows] = await pool.query(
         `SELECT created_at AS time, actor_name AS actor, actor_role AS role, action, entity_type AS entity,
                 entity_id, ip FROM audit_logs WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 2000`, [t]);
+      break;
+    }
+    case 'statutory-pf-ecr':
+    case 'statutory-esi':
+    case 'statutory-pt':
+    case 'statutory-tds': {
+      if (!req.user.permissions.includes('payroll.view')) throw new HttpError(403, 'Missing permission: payroll.view');
+      // Quarterly returns may be requested with fy + quarter; monthly ones fall back to year/month.
+      const kind = key.replace('statutory-', '');
+      const period = req.query.fy
+        ? (() => { const [f, tt] = statutory.fyRange(req.query.fy, req.query.quarter); return { from: f, to: tt }; })()
+        : { year, month };
+      const out = await statutory.buildReturn(t, kind, period);
+      if (kind === 'pt') {
+        columns = ['state', 'employees', 'taxableGross', 'ptCollected'];
+        rows = out.byState.map((s) => ({ state: s.state, employees: s.employees, taxableGross: s.taxableGross, ptCollected: s.ptCollected }));
+      } else if (kind === 'tds') {
+        columns = ['employee_code', 'name', 'pan', 'gross', 'tdsDeposit', 'annualDeposit', 'shortfall', 'variance', 'onTrack'];
+        rows = out.deposits.map((d) => {
+          const a = out.annual.find((x) => x.employeeId === d.employeeId) || {};
+          return {
+            employee_code: d.employeeCode, name: d.name, pan: d.pan || '-', gross: d.gross, tdsDeposit: d.tds,
+            annualDeposit: a.deposited ?? 0, shortfall: a.shortfall ?? 0, variance: a.variance ?? 0, onTrack: a.onTrack ? 'yes' : 'no',
+          };
+        });
+      } else if (kind === 'pf-ecr') {
+        columns = ['employee_code', 'name', 'epfNumber', 'pfWages', 'epsContribution', 'edliContribution', 'epfContribution', 'totalRemittance'];
+        rows = out.items.map((i) => ({
+          employee_code: i.employeeCode, name: i.name, epfNumber: i.epfNumber || '-', pfWages: i.pfWages,
+          epsContribution: i.epsContribution, edliContribution: i.edliContribution,
+          epfContribution: i.epfContribution, totalRemittance: round2(i.epsContribution + i.edliContribution + i.epfContribution),
+        }));
+      } else {
+        columns = ['ipNumber', 'employee_code', 'name', 'esicNumber', 'days', 'grossWages', 'esiEmployee', 'esiEmployer', 'totalRemittance'];
+        rows = out.items.map((i) => ({
+          ipNumber: i.ipNumber, employee_code: i.employeeCode, name: i.name, esicNumber: i.esicNumber || '-',
+          days: i.days, grossWages: i.grossWages, esiEmployee: i.esiEmployee, esiEmployer: i.esiEmployer,
+          totalRemittance: round2(i.esiEmployee + i.esiEmployer),
+        }));
+      }
+      break;
+    }
+    case 'payroll-reconciliation': {
+      if (!req.user.permissions.includes('payroll.view')) throw new HttpError(403, 'Missing permission: payroll.view');
+      const runId = parseInt(req.query.runId || 0, 10);
+      if (!runId) throw new HttpError(400, 'runId is required for the bank reconciliation report');
+      const recon = await statutory.bankReconciliation(t, runId);
+      if (!recon) throw new HttpError(404, 'Run not found');
+      columns = ['employee_code', 'name', 'bankAccount', 'ifsc', 'netPay', 'status', 'flags'];
+      rows = recon.items.map((i) => ({
+        employee_code: i.employeeCode, name: i.name, bankAccount: i.bankAccount || '-', ifsc: i.ifsc || '-',
+        netPay: i.netPay, status: i.status,
+        flags: (recon.exceptions || []).filter((e) => e.employeeId === i.employeeId).map((e) => e.code).join('|') || '-',
+      }));
       break;
     }
     default:

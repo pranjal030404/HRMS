@@ -11,18 +11,44 @@ const { round2 } = require('../utils/helpers');
  *  TDS : { slabs: [{ upto, rate }..., { above: true, rate }], stdDeduction, rebateLimit, rebateAmount, cess }
  *  LWF : { employeeAmount, employerAmount }
  */
+/**
+ * `locations.state` stores a human-readable name ('Karnataka') while statutory rules are keyed
+ * by the ISO-3166 code ('KA'). Without this bridge a state-specific rule silently never matches
+ * and PT computes as zero for everyone.
+ */
+const STATE_CODES = {
+  'andhra pradesh': 'AP', 'arunachal pradesh': 'AR', assam: 'AS', bihar: 'BR', chhattisgarh: 'CG',
+  goa: 'GA', gujarat: 'GJ', haryana: 'HR', 'himachal pradesh': 'HP', jharkhand: 'JH',
+  karnataka: 'KA', kerala: 'KL', 'madhya pradesh': 'MP', maharashtra: 'MH', manipur: 'MN',
+  meghalaya: 'ML', mizoram: 'MZ', nagaland: 'NL', odisha: 'OD', punjab: 'PB', rajasthan: 'RJ',
+  sikkim: 'SK', 'tamil nadu': 'TN', telangana: 'TG', tripura: 'TR', 'uttar pradesh': 'UP',
+  uttarakhand: 'UK', 'west bengal': 'WB', delhi: 'DL', 'new delhi': 'DL',
+  'jammu and kashmir': 'JK', ladakh: 'LA', puducherry: 'PY', 'andaman and nicobar islands': 'AN',
+  'dadra and nagar haveli and daman and diu': 'DH', 'lakshadweep islands': 'LD',
+};
+
+/** Rule lookup preference: exact value, then its ISO code, then the national fallback. */
+function jurisdictionCandidates(jurisdiction) {
+  if (!jurisdiction) return ['IN'];
+  const raw = String(jurisdiction).trim();
+  const code = STATE_CODES[raw.toLowerCase()] || raw.toUpperCase();
+  return [...new Set([raw, code, 'IN'].filter(Boolean))];
+}
+
 async function getRule(tenantId, ruleType, onDate, jurisdiction = 'IN') {
+  const cands = jurisdictionCandidates(jurisdiction);
+  const holes = cands.map(() => '?').join(',');
   const [rows] = await pool.query(
     `SELECT * FROM statutory_rules
      WHERE tenant_id = ? AND rule_type = ? AND effective_from <= ?
        AND (effective_to IS NULL OR effective_to >= ?)
-       AND jurisdiction IN (?, 'IN')
-     ORDER BY (jurisdiction = ?) DESC, effective_from DESC LIMIT 1`,
-    [tenantId, ruleType, onDate, onDate, jurisdiction, jurisdiction]
+       AND jurisdiction IN (${holes})
+     ORDER BY FIELD(jurisdiction, ${holes}) ASC, effective_from DESC LIMIT 1`,
+    [tenantId, ruleType, onDate, onDate, ...cands, ...cands]
   );
   if (!rows[0]) return null;
   const r = rows[0];
-  return { ...r, params: typeof r.params === 'string' ? JSON.parse(r.params) : r.params };
+  return { ...r, params: typeof r.params === 'string' ? JSON.parse(r.params) : r.params, jurisdiction: r.jurisdiction };
 }
 
 function slabTax(amount, slabs) {
@@ -110,7 +136,7 @@ async function computeStatutory({ tenantId, onDate, jurisdiction = 'IN', gross, 
   const ptRule = await getRule(tenantId, 'PT', onDate, jurisdiction);
   if (ptRule && ptRule.params) {
     out.pt = ptTax(ptRule.params, gross);
-    breakdown.pt = { ruleVersion: ptRule.version, jurisdiction };
+    breakdown.pt = { ruleVersion: ptRule.version, jurisdiction: ptRule.jurisdiction || jurisdiction };
   }
 
   const tdsRule = await getRule(tenantId, 'TDS', onDate, 'IN');
@@ -134,4 +160,4 @@ async function computeStatutory({ tenantId, onDate, jurisdiction = 'IN', gross, 
   return { ...out, breakdown };
 }
 
-module.exports = { getRule, computeStatutory, slabTax, ptTax, annualIncomeTax };
+module.exports = { getRule, computeStatutory, slabTax, ptTax, annualIncomeTax, jurisdictionCandidates, STATE_CODES };

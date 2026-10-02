@@ -2,18 +2,24 @@ const express = require('express');
 const { pool } = require('../config/db');
 const { asyncH, HttpError, pick } = require('../utils/helpers');
 const { logAudit } = require('../services/audit');
+const { requirePermission } = require('../middleware/auth');
 
 /**
  * Generic tenant-scoped CRUD for master tables.
  * cfg: {
  *   table, perm, fields: [string...], required: [string...], searchable: [string...],
  *   orderBy: 'name', numericFields: [string...], boolFields: [string...], jsonFields: [string...],
+ *   readPerm: [string...] (defaults to perm with '.manage' → '.view' when applicable)
  *   listWhere: (tenantId, req) => [sql, params] (extra WHERE)
  * }
+ * Reads require the read permission; create/update/delete require cfg.perm.
  */
 function crudRouter(cfg) {
   const r = express.Router();
   const allCols = () => cfg.fields.join(', ');
+  const readPerm = cfg.readPerm || (cfg.perm.endsWith('.manage') ? cfg.perm.replace(/\.manage$/, '.view') : cfg.perm);
+  const gateRead = requirePermission(readPerm);
+  const gateWrite = requirePermission(cfg.perm);
 
   const coerce = (body) => {
     const data = pick(body, cfg.fields);
@@ -23,7 +29,7 @@ function crudRouter(cfg) {
     return data;
   };
 
-  r.get('/', asyncH(async (req, res) => {
+  r.get('/', gateRead, asyncH(async (req, res) => {
     const params = [req.user.tenant_id];
     let where = 'tenant_id = ?';
     if (cfg.listWhere) {
@@ -43,7 +49,7 @@ function crudRouter(cfg) {
     res.json({ data: rows });
   }));
 
-  r.get('/:id', asyncH(async (req, res) => {
+  r.get('/:id', gateRead, asyncH(async (req, res) => {
     const [rows] = await pool.query(
       `SELECT id, ${allCols()} FROM ${cfg.table} WHERE id = ? AND tenant_id = ?`,
       [req.params.id, req.user.tenant_id]
@@ -52,7 +58,7 @@ function crudRouter(cfg) {
     res.json({ data: rows[0] });
   }));
 
-  r.post('/', asyncH(async (req, res) => {
+  r.post('/', gateWrite, asyncH(async (req, res) => {
     const data = coerce(req.body);
     for (const f of cfg.required || []) {
       if (data[f] === undefined || data[f] === null) throw new HttpError(400, `${f} is required`);
@@ -67,7 +73,7 @@ function crudRouter(cfg) {
     res.status(201).json({ data: { id: ins.insertId, ...data } });
   }));
 
-  r.put('/:id', asyncH(async (req, res) => {
+  r.put('/:id', gateWrite, asyncH(async (req, res) => {
     const [before] = await pool.query(`SELECT id, ${allCols()} FROM ${cfg.table} WHERE id = ? AND tenant_id = ?`, [req.params.id, req.user.tenant_id]);
     if (!before[0]) throw new HttpError(404, 'Record not found');
     const data = coerce(req.body);
@@ -80,7 +86,7 @@ function crudRouter(cfg) {
     res.json({ data: { id: Number(req.params.id), ...before[0], ...data } });
   }));
 
-  r.delete('/:id', asyncH(async (req, res) => {
+  r.delete('/:id', gateWrite, asyncH(async (req, res) => {
     const [before] = await pool.query(`SELECT id, ${allCols()} FROM ${cfg.table} WHERE id = ? AND tenant_id = ?`, [req.params.id, req.user.tenant_id]);
     if (!before[0]) throw new HttpError(404, 'Record not found');
     await pool.query(`DELETE FROM ${cfg.table} WHERE id = ? AND tenant_id = ?`, [req.params.id, req.user.tenant_id]);

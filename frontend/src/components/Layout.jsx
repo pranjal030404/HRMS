@@ -18,11 +18,17 @@ const I = {
   life: <path d="M12 21c-4-3-8-6.2-8-10a4.5 4.5 0 0 1 8-2.8A4.5 4.5 0 0 1 20 11c0 3.8-4 7-8 10z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />,
   ticket: <path d="M4 7a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v2a2 2 0 0 0 0 6v2a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-2a2 2 0 0 0 0-6V7z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />,
   users: <path d="M16 11a4 4 0 1 0-4-4M22 21v-1a5 5 0 0 0-4-4.9M2 21v-1a6 6 0 0 1 9-5.2" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />,
+  talent: <path d="M8 21h8M12 17v4M7 4h10v4a5 5 0 0 1-10 0V4zM7 5H4a3 3 0 0 0 3 5M17 5h3a3 3 0 0 1-3 5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />,
+  shield: <path d="M12 3l8 3v5c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-3z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />,
+  plane: <path d="M10.5 13.5L3 11l1.5-2 6 1 4.5-5.5a1.6 1.6 0 0 1 2.5 2L12 12l1 6-2 1.5-2.5-6z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />,
+  spark: <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3zM19 16l.9 2.1L22 19l-2.1.9L19 22l-.9-2.1L16 19l2.1-.9L19 16z" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />,
+  flow: <><circle cx="5" cy="6" r="2.2" fill="none" stroke="currentColor" strokeWidth="1.8" /><circle cx="19" cy="6" r="2.2" fill="none" stroke="currentColor" strokeWidth="1.8" /><circle cx="12" cy="18" r="2.2" fill="none" stroke="currentColor" strokeWidth="1.8" /><path d="M7 7.5l3.5 8M17 7.5l-3.5 8M7.2 6h9.6" fill="none" stroke="currentColor" strokeWidth="1.6" /></>,
+  plug: <path d="M9 7V3M15 7V3M7 7h10v4a5 5 0 0 1-10 0V7zM12 16v5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />,
 };
 const Icon = ({ d }) => <svg viewBox="0 0 24 24" width="17" height="17">{d}</svg>;
 
 export default function Layout() {
-  const { me, logout, can } = useAuth();
+  const { me, logout, can, moduleOn } = useAuth();
   const nav = useNavigate();
   const loc = useLocation();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -59,6 +65,31 @@ export default function Layout() {
     setNotifs((n) => ({ ...n, unread: 0, data: n.data.map((x) => ({ ...x, read_at: x.read_at || new Date().toISOString() })) }));
   };
 
+  // Mirrors the `permission` values in /api/administration/meta so the sidebar
+  // entry appears if the user can reach any Administration Center section.
+  const ADMIN_SECTION_PERMS = [
+    'administration.view',
+    'administration.organization.view',
+    'administration.users.view',
+    'administration.roles.view',
+    'administration.permissions.view',
+    'administration.access_preview.view',
+    'platform.tenants.view',
+    'administration.workflows.view',
+    'administration.custom_fields.view',
+    'administration.master_data.view',
+    'administration.modules.view',
+    'administration.security.view',
+    'administration.config.view',
+    'administration.bulk.manage',
+    'administration.onboarding.view',
+    'administration.audit.view',
+  ];
+
+  // A feature entry needs two answers to agree: the company has the module on,
+  // and the user holds a permission inside it.
+  const show = (moduleKey, ...perms) => moduleOn(moduleKey) && perms.some((p) => can(p));
+
   const navSections = [
     {
       label: 'Main', items: [
@@ -68,33 +99,59 @@ export default function Layout() {
     },
     {
       label: 'People', items: [
-        { to: '/employees', icon: I.emp, label: 'Employees', show: can('employee.view') },
+        { to: '/employees', icon: I.emp, label: 'Employees', show: show('employees', 'employee.view') },
         { to: '/org/departments', icon: I.brief, label: 'Organization', show: can('org.view') },
-        { to: '/attendance', icon: I.clock, label: 'Attendance', show: can('attendance.view') },
-        { to: '/leave', icon: I.cal, label: 'Leave', show: can('leave.view') },
-        { to: '/onboarding', icon: I.users, label: 'Onboarding & Exit', show: can('onboarding.view') || can('separation.view') },
+        { to: '/attendance', icon: I.clock, label: 'Attendance', show: show('attendance', 'attendance.view') },
+        { to: '/leave', icon: I.cal, label: 'Leave', show: show('leave', 'leave.view') },
+        { to: '/onboarding', icon: I.users, label: 'Onboarding & Exit', show: show('lifecycle', 'onboarding.view', 'separation.view') },
+        { to: '/talent', icon: I.talent, label: 'Talent & Succession', show: show('talent', 'talent.view') },
+        { to: '/relations', icon: I.shield, label: 'Employee Relations', show: show('employee_relations', 'relations.view') },
       ],
     },
     {
       label: 'Pay & Finance', items: [
-        { to: '/payroll', icon: I.money, label: 'Payroll', show: can('payroll.view') },
-        { to: '/expenses', icon: I.doc, label: 'Expenses & Loans', show: can('expense.view') || can('loan.view') },
-        { to: '/billing', icon: I.chart, label: 'Billing', show: can('billing.view') },
+        { to: '/payroll', icon: I.money, label: 'Payroll', show: show('payroll', 'payroll.view') },
+        { to: '/payroll/adjustments', icon: I.flow, label: 'Adjustments', show: show('payroll', 'payroll.adjust', 'payroll.adjust_approve') },
+        { to: '/payroll/statutory/returns', icon: I.doc, label: 'Statutory Returns', show: show('payroll', 'payroll.view') },
+        { to: '/compensation', icon: I.chart, label: 'Compensation', show: show('compensation', 'compensation.view') },
+        { to: '/benefits', icon: I.life, label: 'Benefits', show: show('benefits', 'benefit.view') },
+        { to: '/expenses', icon: I.doc, label: 'Expenses & Loans', show: show('expenses', 'expense.view', 'loan.view') },
+        { to: '/travel', icon: I.plane, label: 'Travel', show: show('travel', 'travel.view', 'travel.create') },
+        { to: '/billing', icon: I.chart, label: 'Billing', show: show('billing', 'billing.view') },
       ],
     },
     {
       label: 'Talent & Ops', items: [
-        { to: '/recruitment', icon: I.users, label: 'Recruitment', show: can('recruitment.view') },
-        { to: '/performance', icon: I.chart, label: 'Performance', show: can('performance.view') },
-        { to: '/documents', icon: I.doc, label: 'Documents', show: can('document.view') },
-        { to: '/assets', icon: I.box, label: 'Assets', show: can('asset.view') },
-        { to: '/tickets', icon: I.ticket, label: 'Helpdesk', show: can('ticket.view') },
+        { to: '/recruitment', icon: I.users, label: 'Recruitment', show: show('recruitment', 'recruitment.view') },
+        { to: '/performance', icon: I.chart, label: 'Performance', show: show('performance', 'performance.view') },
+        { to: '/engagement', icon: I.spark, label: 'Engagement', show: show('engagement', 'engagement.view', 'engagement.respond') },
+        { to: '/timesheets', icon: I.clock, label: 'Timesheets', show: show('timesheets', 'timesheet.view', 'timesheet.create') },
+        { to: '/documents', icon: I.doc, label: 'Documents', show: show('documents', 'document.view') },
+        { to: '/assets', icon: I.box, label: 'Assets', show: show('assets', 'asset.view') },
+        { to: '/tickets', icon: I.ticket, label: 'Helpdesk', show: show('helpdesk', 'ticket.view') },
       ],
     },
     {
-      label: 'Insights', items: [
+      label: 'Insights & Automation', items: [
+        { to: '/analytics', icon: I.chart, label: 'People Analytics', show: show('analytics', 'analytics.view') },
+        { to: '/workforce', icon: I.brief, label: 'Workforce Planning', show: show('workforce_planning', 'workforce.view') },
+        { to: '/workflows', icon: I.flow, label: 'Workflows', show: show('workflow', 'workflow.view', 'workflow.action') },
+        { to: '/ai-assistant', icon: I.spark, label: 'AI Assistant', show: moduleOn('ai_assistant') },
         { to: '/reports', icon: I.chart, label: 'Reports', show: can('report.view') },
+        { to: '/integrations', icon: I.plug, label: 'Integrations', show: show('integrations', 'integration.manage') },
+        { to: '/notifications', icon: I.bell, label: 'Notification Center', show: moduleOn('notifications') && (can('notification.manage') || !!me?.employee_id) },
+      ],
+    },
+    {
+      label: 'System', items: [
+        { to: '/security', icon: I.shield, label: 'My Security', show: true },
         { to: '/settings', icon: I.gear, label: 'Settings', show: can('settings.view') || can('user.manage') },
+        {
+          to: '/administration',
+          icon: I.gear,
+          label: 'Administration',
+          show: ADMIN_SECTION_PERMS.some((p) => can(p)),
+        },
       ],
     },
   ];
@@ -167,13 +224,14 @@ export default function Layout() {
               <div className="menu-pop">
                 <div style={{ padding: '8px 12px', fontSize: 12, color: 'var(--muted)' }}>{me?.email}</div>
                 {me?.employee_id && <button className="mi" onClick={() => { nav('/portal/profile'); setShowMenu(false); }}>My profile</button>}
+                <button className="mi" onClick={() => { nav('/security'); setShowMenu(false); }}>Security & devices</button>
                 {can('settings.view') && <button className="mi" onClick={() => { nav('/settings'); setShowMenu(false); }}>Settings</button>}
                 <button className="mi" onClick={async () => { await logout(); nav('/login'); }}>Sign out</button>
               </div>
             )}
           </div>
         </header>
-        <div className="content">
+        <div className="content page-enter" key={loc.pathname}>
           <Outlet />
         </div>
       </div>

@@ -63,17 +63,35 @@ async function calculateRun(tenantId, runId, actor) {
   const loansByEmp = {};
   for (const li of loans) (loansByEmp[li.employee_id] ||= []).push(li);
 
+  // Approved claims that have not been paid out by any run yet. Deliberately NOT scoped to the
+  // run's period: a claim is frequently approved after the month it was spent in, and tying the
+  // lookup to expense_date would strand it forever.
   const [expRows] = await pool.query(
     `SELECT ec.id, ec.employee_id, ec.amount, ec.title FROM expense_claims ec
      WHERE ec.tenant_id = ? AND ec.status = 'approved' AND ec.reimbursed_run_id IS NULL
-       AND YEAR(ec.expense_date) = ? AND MONTH(ec.expense_date) = ?`,
-    [tenantId, run.period_year, run.period_month]
+     ORDER BY ec.id`,
+    [tenantId]
   );
   const expByEmp = {};
   for (const e of expRows) (expByEmp[e.employee_id] ||= []).push(e);
 
+  // Approved adjustments that have not been consumed by a run yet. These are how locked or
+  // paid periods are corrected (arrears, back-pay, corrections) and how bonus awards and
+  // F&F settlements reach the payslip, without ever mutating a closed run.
+  const [adjRows] = await pool.query(
+    `SELECT id, employee_id, atype, direction, component, description, amount,
+            for_period_year, for_period_month, original_run_id
+     FROM payroll_adjustments
+     WHERE tenant_id = ? AND status = 'approved' AND applied_run_id IS NULL
+     ORDER BY id`,
+    [tenantId]
+  );
+  const adjByEmp = {};
+  for (const a of adjRows) (adjByEmp[a.employee_id] ||= []).push(a);
+
   const exceptions = [];
   const items = [];
+  const consumedAdjustmentIds = new Set();
 
   for (const emp of employees) {
     const salary = await getEffectiveSalary(tenantId, emp.id, monthEnd);
@@ -206,11 +224,35 @@ async function calculateRun(tenantId, runId, actor) {
     const reimbursements = (expByEmp[emp.id] || []).map((e) => ({ code: `EXP_${e.id}`, name: `Reimbursement: ${e.title}`, amount: round2(e.amount), expenseClaimId: e.id }));
     const totalReimb = round2(reimbursements.reduce((s, r) => s + r.amount, 0));
 
+    // Approved adjustments (arrears / back-pay / corrections / bonus / F&F).
+    // Applied after statutory so the versioned rules stay deterministic for the base salary
+    // components; PF/ESI corrections arising from arrears are handled out-of-band.
+    const adjEarnings = [];
+    const adjDeductions = [];
+    for (const a of adjByEmp[emp.id] || []) {
+      const line = {
+        code: a.component,
+        name: a.description || a.component,
+        amount: round2(a.amount),
+        direction: a.direction,
+        adjustmentId: a.id,
+        atype: a.atype,
+        forPeriod: a.for_period_month ? `${a.for_period_month}/${a.for_period_year}` : null,
+      };
+      if (a.direction === 'deduction') adjDeductions.push(line);
+      else adjEarnings.push(line);
+      consumedAdjustmentIds.add(a.id);
+    }
+    const totalAdjEarn = round2(adjEarnings.reduce((s, a) => s + a.amount, 0));
+    const totalAdjDed = round2(adjDeductions.reduce((s, a) => s + a.amount, 0));
+    const adjustmentsTotal = round2(totalAdjEarn - totalAdjDed);
+    const adjustments = [...adjEarnings, ...adjDeductions];
+
     const deductions = [...statutoryEmp, ...otherDeductions, ...loanDeductions];
     const totalDeductions = round2(deductions.reduce((s, d) => s + d.amount, 0));
     const employerContrib = statutoryEr;
     const employerCost = round2(gross + employerContrib.reduce((s, d) => s + d.amount, 0));
-    const netPay = round2(gross - totalDeductions + totalReimb);
+    const netPay = round2(gross - totalDeductions + totalReimb + adjustmentsTotal);
 
     if (netPay < 0) exceptions.push({ employeeId: emp.id, employeeCode: emp.employee_code, name: `${emp.first_name} ${emp.last_name}`, code: 'NEGATIVE_NET', severity: 'error', message: `Net pay is negative (${netPay})` });
     if (lopDays > monthDays) exceptions.push({ employeeId: emp.id, employeeCode: emp.employee_code, name: `${emp.first_name} ${emp.last_name}`, code: 'LOP_EXCEEDS', severity: 'error', message: 'Loss of pay exceeds month days' });
@@ -226,16 +268,44 @@ async function calculateRun(tenantId, runId, actor) {
       deductions,
       employerContrib,
       reimbursements,
+      adjustments,
+      totalReimb,
+      adjustmentsTotal,
       gross,
       totalDeductions,
       netPay,
       employerCost,
       inputsSnapshot: {
         otMinutes, monthStart, monthEnd, statutoryBreakdown: statutory.breakdown,
+        // Full statutory values (incl. EPS, which is not a payslip line) so statutory
+        // returns can be rebuilt from the stored snapshot without re-running the engine.
+        statutoryValues: {
+          pfEmployee: statutory.pfEmployee, pfEmployer: statutory.pfEmployer, pfEps: statutory.pfEps,
+          esiEmployee: statutory.esiEmployee, esiEmployer: statutory.esiEmployer,
+          pt: statutory.pt, tds: statutory.tds,
+          lwfEmployee: statutory.lwfEmployee, lwfEmployer: statutory.lwfEmployer,
+        },
         salaryId: salary.id, salaryItems: itemsArr.map((i) => ({ code: i.code, amount: i.amount, formula: i.formula, calcType: i.calcType })),
         declarations,
+        adjustmentIds: adjustments.map((a) => a.adjustmentId),
+        reimbursementClaimIds: reimbursements.map((r) => r.expenseClaimId),
       },
       statutory,
+    });
+  }
+
+  // Any approved adjustment for an employee who was not in this run's population can never be
+  // applied automatically — surface it instead of silently stranding the money.
+  for (const a of adjRows) {
+    if (consumedAdjustmentIds.has(a.id)) continue;
+    const [e] = await pool.query('SELECT employee_code, first_name, last_name, status FROM employees WHERE id = ?', [a.employee_id]);
+    exceptions.push({
+      employeeId: a.employee_id,
+      employeeCode: e[0]?.employee_code || null,
+      name: e[0] ? `${e[0].first_name} ${e[0].last_name}` : 'Unknown employee',
+      code: 'ADJUSTMENT_UNAPPLIED',
+      severity: 'warning',
+      message: `Adjustment #${a.id} (${a.atype} ₹${a.amount}) not applied — employee is ${e[0]?.status || 'not in scope'} for this period`,
     });
   }
 
@@ -244,11 +314,13 @@ async function calculateRun(tenantId, runId, actor) {
     for (const it of items) {
       await conn.query(
         `INSERT INTO payroll_items (tenant_id, run_id, employee_id, month_days, payable_days, lop_days,
-          earnings, deductions, employer_contrib, gross, total_deductions, net_pay, employer_cost, inputs_snapshot)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          earnings, deductions, reimbursements, adjustments, employer_contrib,
+          gross, total_deductions, reimbursements_total, adjustments_total, net_pay, employer_cost, inputs_snapshot)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [tenantId, runId, it.employeeId, it.monthDays, it.payableDays, it.lopDays,
-          JSON.stringify(it.earnings), JSON.stringify(it.deductions), JSON.stringify(it.employerContrib),
-          it.gross, it.totalDeductions, it.netPay, it.employerCost, JSON.stringify(it.inputsSnapshot)]
+          JSON.stringify(it.earnings), JSON.stringify(it.deductions),
+          JSON.stringify(it.reimbursements), JSON.stringify(it.adjustments), JSON.stringify(it.employerContrib),
+          it.gross, it.totalDeductions, it.totalReimb, it.adjustmentsTotal, it.netPay, it.employerCost, JSON.stringify(it.inputsSnapshot)]
       );
     }
     const totals = {
@@ -256,6 +328,8 @@ async function calculateRun(tenantId, runId, actor) {
       gross: round2(items.reduce((s, i) => s + i.gross, 0)),
       net: round2(items.reduce((s, i) => s + i.netPay, 0)),
       totalDeductions: round2(items.reduce((s, i) => s + i.totalDeductions, 0)),
+      reimbursements: round2(items.reduce((s, i) => s + i.totalReimb, 0)),
+      adjustments: round2(items.reduce((s, i) => s + i.adjustmentsTotal, 0)),
       employerCost: round2(items.reduce((s, i) => s + i.employerCost, 0)),
     };
     await conn.query(
@@ -309,7 +383,7 @@ async function transitionRun(tenantId, runId, action, actor) {
           }
         }
       }
-      // mark loan EMIs deducted and expense claims reimbursed
+      // Settle loan EMIs, reimburse approved expense claims, and consume approved adjustments.
       for (const item of empRows) {
         const deductions = Array.isArray(item.deductions) ? item.deductions : JSON.parse(item.deductions || '[]');
         for (const d of deductions) {
@@ -317,9 +391,27 @@ async function transitionRun(tenantId, runId, action, actor) {
             await pool.query('UPDATE loan_installments SET status = "deducted", payroll_run_id = ?, paid_at = NOW() WHERE id = ?', [runId, d.loanInstallmentId]);
             await pool.query('UPDATE loans SET outstanding = GREATEST(0, outstanding - ?) WHERE id = ? AND id = (SELECT loan_id FROM loan_installments WHERE id = ?)', [d.amount, d.loanInstallmentId, d.loanInstallmentId]);
           }
-          if (d.expenseClaimId) {
-            await pool.query('UPDATE expense_claims SET status = "reimbursed", reimbursed_run_id = ? WHERE id = ?', [runId, d.expenseClaimId]);
-          }
+        }
+        // Reimbursements live in their own column; they are added to net pay but are not
+        // deductions, so they must be settled separately or the claim would be paid twice.
+        const reimbursements = Array.isArray(item.reimbursements) ? item.reimbursements : JSON.parse(item.reimbursements || '[]');
+        for (const r of reimbursements) {
+          if (!r.expenseClaimId) continue;
+          await pool.query(
+            `UPDATE expense_claims SET status = 'reimbursed', reimbursed_run_id = ?
+             WHERE id = ? AND tenant_id = ? AND status = 'approved' AND reimbursed_run_id IS NULL`,
+            [runId, r.expenseClaimId, tenantId]
+          );
+        }
+        // Adjustments are settled exactly once.
+        const adjustments = Array.isArray(item.adjustments) ? item.adjustments : JSON.parse(item.adjustments || '[]');
+        for (const a of adjustments) {
+          if (!a.adjustmentId) continue;
+          await pool.query(
+            `UPDATE payroll_adjustments SET status = 'applied', applied_run_id = ?, applied_at = NOW()
+             WHERE id = ? AND tenant_id = ? AND status = 'approved' AND applied_run_id IS NULL`,
+            [runId, a.adjustmentId, tenantId]
+          );
         }
       }
       // notify employees
@@ -373,4 +465,65 @@ async function bankFile(tenantId, runId) {
   }));
 }
 
-module.exports = { calculateRun, transitionRun, bankFile, getEffectiveSalary };
+/**
+ * Create a payroll adjustment. Used by the integrations (bonus awards, F&F settlements) and by
+ * the manual arrears/back-pay screen. `sourceType` + `sourceId` make the insert idempotent, so
+ * re-approving a bonus award will not double-book it.
+ */
+async function createAdjustment(tenantId, actor, {
+  employeeId, atype = 'other', direction = 'earning', component, description,
+  amount, forPeriodYear = null, forPeriodMonth = null, originalRunId = null,
+  sourceType = 'manual', sourceId = null, reason = null, submit = true, autoApprove = false,
+}) {
+  const amt = round2(amount);
+  if (!employeeId) throw new HttpError(400, 'employeeId required');
+  if (!component) throw new HttpError(400, 'component required');
+  if (!(amt > 0)) throw new HttpError(400, 'amount must be greater than 0');
+  if (!['earning', 'deduction'].includes(direction)) throw new HttpError(400, 'direction must be earning or deduction');
+  // autoApprove is for trusted system integrations (bonus approval, F&F) where the approving
+  // workflow already happened upstream — it is never reachable from the manual adjustments API.
+  if (autoApprove && (!sourceType || sourceType === 'manual')) {
+    throw new HttpError(400, 'autoApprove requires a named sourceType (bonus, fnf, ...)');
+  }
+
+  const [emp] = await pool.query('SELECT id FROM employees WHERE id = ? AND tenant_id = ?', [employeeId, tenantId]);
+  if (!emp[0]) throw new HttpError(404, 'Employee not found');
+
+  const status = autoApprove ? 'approved' : submit ? 'submitted' : 'draft';
+
+  // Idempotency: a named source (bonus/F&F) must never double-book, so resolve the existing
+  // row explicitly instead of relying on driver-specific ON DUPLICATE KEY affectedRows.
+  if (sourceType !== 'manual' && sourceId) {
+    const [existing] = await pool.query(
+      'SELECT id, status, applied_run_id FROM payroll_adjustments WHERE tenant_id = ? AND source_type = ? AND source_id = ?',
+      [tenantId, sourceType, sourceId]
+    );
+    if (existing[0]) {
+      return { id: existing[0].id, status: existing[0].status, appliedRunId: existing[0].applied_run_id, reused: true };
+    }
+  }
+
+  const [ins] = await pool.query(
+    `INSERT INTO payroll_adjustments
+       (tenant_id, employee_id, atype, direction, component, description, amount,
+        for_period_year, for_period_month, original_run_id, source_type, source_id, status, reason, requested_by, requested_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW())`,
+    [tenantId, employeeId, atype, direction, String(component).slice(0, 60), description || null, amt,
+      forPeriodYear, forPeriodMonth, originalRunId, sourceType, sourceId,
+      status, reason || null, actor?.id || null]
+  );
+  if (autoApprove) {
+    await pool.query('UPDATE payroll_adjustments SET actioned_by = ?, actioned_at = NOW() WHERE id = ?', [actor?.id || null, ins.insertId]);
+  }
+
+  if (submit || autoApprove) {
+    await logAudit({
+      tenantId, actor, action: `payroll.adjustment_${autoApprove ? 'auto_approve' : 'request'}`,
+      entityType: 'payroll_adjustment', entityId: ins.insertId,
+      after: { employeeId, atype, direction, amount: amt, component, sourceType, sourceId, status }, req: null,
+    });
+  }
+  return { id: ins.insertId, status, appliedRunId: null, reused: false };
+}
+
+module.exports = { calculateRun, transitionRun, bankFile, getEffectiveSalary, createAdjustment };

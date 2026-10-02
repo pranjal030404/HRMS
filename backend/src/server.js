@@ -14,4 +14,9 @@ async function start() {
   app.listen(env.port, () => console.log(`[server] Arthvex HRMS API listening on http://localhost:${env.port}`));
 }
 
+// A failed query in one request must never take the API down. Log it loudly and
+// keep serving; the request that triggered it already returned an error.
+process.on('unhandledRejection', (err) => console.error('[process] unhandled rejection:', err?.stack || err));
+process.on('uncaughtException', (err) => console.error('[process] uncaught exception:', err?.stack || err));
+
 start();

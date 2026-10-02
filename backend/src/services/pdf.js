@@ -32,6 +32,13 @@ async function generatePayslipPdf({ tenantId, item, run, payslipId }) {
   const tenant = tRows[0] || {};
   const earnings = Array.isArray(item.earnings) ? item.earnings : JSON.parse(item.earnings || '[]');
   const deductions = Array.isArray(item.deductions) ? item.deductions : JSON.parse(item.deductions || '[]');
+  const reimbursements = Array.isArray(item.reimbursements) ? item.reimbursements : JSON.parse(item.reimbursements || '[]');
+  const adjLines = Array.isArray(item.adjustments) ? item.adjustments : JSON.parse(item.adjustments || '[]');
+  const adjEarnings = adjLines.filter((a) => a.direction !== 'deduction');
+  const adjDeductions = adjLines.filter((a) => a.direction === 'deduction');
+  const sum = (arr) => round2(arr.reduce((s, x) => s + Number(x.amount || 0), 0));
+  const totalReimb = round2(Number(item.reimbursements_total ?? sum(reimbursements)));
+  const adjustmentsTotal = round2(Number(item.adjustments_total ?? (sum(adjEarnings) - sum(adjDeductions))));
   const period = `${dayjs().month(run.period_month - 1).format('MMMM')} ${run.period_year}`;
 
   const dir = ensure('payslips');
@@ -79,16 +86,33 @@ async function generatePayslipPdf({ tenantId, item, run, payslipId }) {
     // earnings / deductions table
     y = 220;
     const colW = 250;
-    doc.fontSize(10).font('Helvetica-Bold').fill('#111111').text('Earnings', 56, y);
-    doc.text('Deductions', 56 + colW + 40, y);
-    y += 18;
-    doc.moveTo(56, y).lineTo(56 + colW, y).moveTo(56 + colW + 40, y).lineTo(56 + colW * 2 + 40, y).strokeColor('#cccccc').stroke();
-    y += 8;
-
-    const maxRows = Math.max(earnings.length, deductions.length);
     const rowH = 16;
+    const PAGE_BOTTOM = 792;
+    // Keep every section header together with at least its first rows, and never collide
+    // with the footer note that is stamped on each page.
+    const need = (h) => {
+      if (y + h > PAGE_BOTTOM - 46) { doc.addPage(); y = 56; }
+      return y;
+    };
+    const sectionTitle = (label, sub) => {
+      need(30);
+      doc.fontSize(10).font('Helvetica-Bold').fill('#111111').text(label, 56, y);
+      if (sub) doc.font('Helvetica').fontSize(8).fill('#777777').text(sub, 56 + colW - 120, y + 2, { width: 120, align: 'right' });
+      y += 16;
+      doc.moveTo(56, y).lineTo(56 + colW * 2 + 40, y).strokeColor('#cccccc').stroke();
+      y += 8;
+    };
+    const lineRow = (name, amount, leftX, rightX, muted) => {
+      doc.fill(muted ? '#777777' : '#333333').fontSize(9);
+      doc.text(name, leftX, y, { width: colW - 80, ellipsis: true });
+      doc.text(fmt(amount), rightX, y, { width: 66, align: 'right' });
+    };
+
+    sectionTitle('Earnings', 'Deductions');
+    const maxRows = Math.max(earnings.length, deductions.length);
     doc.font('Helvetica').fontSize(9);
     for (let i = 0; i < maxRows; i++) {
+      need(rowH + 4);
       const e = earnings[i];
       const d = deductions[i];
       if (i % 2 === 0) doc.rect(52, y - 3, colW + 8, rowH).fill('#f6f7f9').rect(52 + colW + 36, y - 3, colW + 8, rowH).fill('#f6f7f9');
@@ -104,18 +128,65 @@ async function generatePayslipPdf({ tenantId, item, run, payslipId }) {
       y += rowH;
     }
 
-    // totals
-    y += 6;
-    doc.moveTo(56, y).lineTo(56 + colW * 2 + 40, y).strokeColor('#cccccc').stroke();
+    // Reimbursements are shown on their own line and are never mixed into gross earnings.
+    if (reimbursements.length) {
+      y += 8;
+      need(24 + reimbursements.length * rowH);
+      const fullW = colW * 2 + 40;
+      doc.font('Helvetica-Bold').fontSize(9).fill('#111111').text('Reimbursements', 56, y);
+      doc.font('Helvetica').fontSize(8.5).fill('#777777')
+        .text('non-taxable, outside gross', 56 + fullW - 140, y + 1, { width: 140, align: 'right' });
+      y += 16;
+      doc.moveTo(56, y).lineTo(56 + fullW, y).strokeColor('#e2e5ea').stroke();
+      y += 8;
+      for (const r of reimbursements) {
+        need(rowH);
+        lineRow(r.name, r.amount, 56, 56 + fullW - 80, true);
+        y += rowH;
+      }
+    }
+
+    // One-time adjustments (arrears, back-pay, corrections, bonus, F&F). Shown separately from
+    // the base components because they are not part of gross for the month.
+    if (adjLines.length) {
+      y += 8;
+      need(24 + adjLines.length * rowH);
+      const fullW = colW * 2 + 40;
+      doc.font('Helvetica-Bold').fontSize(9).fill('#111111').text('One-Time Adjustments', 56, y);
+      doc.font('Helvetica').fontSize(8.5).fill('#777777')
+        .text(`net ${adjustmentsTotal >= 0 ? '+' : '-'} ${fmt(Math.abs(adjustmentsTotal))}`, 56 + fullW - 140, y + 1, { width: 140, align: 'right' });
+      y += 16;
+      doc.moveTo(56, y).lineTo(56 + fullW, y).strokeColor('#e2e5ea').stroke();
+      y += 8;
+      for (const a of adjLines) {
+        need(rowH);
+        const isDed = a.direction === 'deduction';
+        const note = a.forPeriod ? `  (for ${a.forPeriod})` : '';
+        doc.fill('#333333').fontSize(9);
+        doc.text(a.name + note, 56, y, { width: fullW - 96, ellipsis: true, lineBreak: false });
+        doc.text((isDed ? '- ' : '+ ') + fmt(a.amount), 56 + fullW - 80, y, { width: 76, align: 'right' });
+        y += rowH;
+      }
+    }
+
+    // totals — must reconcile: gross + reimbursements + adjustments - deductions = net
     y += 10;
-    doc.font('Helvetica-Bold').fontSize(9).fill('#111111');
-    doc.text('Gross Earnings', 56, y);
-    doc.text(fmt(item.gross), 56 + colW - 70, y, { width: 66, align: 'right' });
-    doc.text('Total Deductions', 56 + colW + 40, y);
-    doc.text(fmt(item.total_deductions), 56 + colW * 2 - 30, y, { width: 66, align: 'right' });
-    y += 22;
+    need(76);
+    doc.moveTo(56, y).lineTo(56 + colW * 2 + 40, y).strokeColor('#cccccc').stroke();
+    y += 12;
+    const summaryRow = (label, value, bold, indent) => {
+      doc.font(bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(bold ? 9.5 : 9).fill(bold ? '#111111' : '#444444');
+      doc.text(label, 56 + (indent || 0), y);
+      doc.text(fmt(value), 56 + colW - 70, y, { width: 66, align: 'right' });
+      y += 15;
+    };
+    summaryRow('Gross Earnings', item.gross, true);
+    if (reimbursements.length) summaryRow('  Reimbursements', totalReimb, false, 8);
+    if (adjLines.length) summaryRow(`  Adjustments ${adjustmentsTotal >= 0 ? '(+)' : '(-)'}`, Math.abs(adjustmentsTotal), false, 8);
+    summaryRow('Total Deductions', item.total_deductions, true);
+    y += 4;
     doc.roundedRect(52, y, 507, 30, 6).fill(primary);
-    doc.fill('#ffffff').fontSize(11);
+    doc.fill('#ffffff').fontSize(11).font('Helvetica-Bold');
     doc.text('NET PAY', 68, y + 10);
     doc.text('Rs. ' + fmt(item.net_pay), 300, y + 10, { width: 245, align: 'right' });
     y += 40;
@@ -124,17 +195,19 @@ async function generatePayslipPdf({ tenantId, item, run, payslipId }) {
     y += 22;
     const erContrib = Array.isArray(item.employer_contrib) ? item.employer_contrib : JSON.parse(item.employer_contrib || '[]');
     if (erContrib.length) {
+      need(20 + erContrib.length * rowH);
       doc.font('Helvetica-Bold').fontSize(9).fill('#111111').text('Employer Contributions', 56, y);
       y += 14;
       doc.font('Helvetica').fontSize(9).fill('#333333');
       for (const c of erContrib) {
+        need(rowH);
         doc.text(c.name, 56, y, { width: 160, ellipsis: true });
         doc.text(fmt(c.amount), 250, y, { align: 'right', width: 60 });
         y += rowH;
       }
       y += 6;
     }
-    y += 26;
+    need(34);
     doc.fontSize(7.5).fill('#888888');
     text(doc, 'This is a computer-generated payslip and does not require a signature. Amounts are in INR.', 56, y);
     text(doc, `Generated on ${dayjs().format('DD MMM YYYY, HH:mm')}`, 56, y + 12);

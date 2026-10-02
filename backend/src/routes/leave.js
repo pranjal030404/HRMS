@@ -6,6 +6,8 @@ const { authenticate, requirePermission, scopeFor, departmentRowCondition, heade
 const { getBalances, priceLeaveRequest, markLeaveAttendance, revertLeaveAttendance } = require('../services/leave');
 const { logAudit } = require('../services/audit');
 const { notifyEvent } = require('../services/notify');
+const { fireTrigger } = require('../services/workflow');
+const { emitEvent } = require('../services/webhooks');
 
 const r = express.Router();
 r.use(authenticate);
@@ -88,6 +90,9 @@ r.post('/requests', requirePermission('leave.apply'), asyncH(async (req, res) =>
     recipients, link: '/leave/requests',
   });
   await logAudit({ tenantId: req.user.tenant_id, actor: req.user, action: 'leave.apply', entityType: 'leave_request', entityId: ins.insertId, after: { startDate, endDate, days }, req });
+  // workflow engine (spec §7): long leaves route through configured approval workflows
+  await fireTrigger({ tenantId: req.user.tenant_id, triggerEvent: 'leave.submitted', entityType: 'leave_request', entityId: ins.insertId, ctx: { employeeId: emp.id, days, leaveTypeId: type.id }, req });
+  await emitEvent({ tenantId: req.user.tenant_id, eventType: 'leave.submitted', payload: { id: ins.insertId, employeeId: emp.id, days, startDate, endDate } });
   res.status(201).json({ data: { id: ins.insertId, days, breakdown } });
 }));
 

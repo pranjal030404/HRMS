@@ -24,6 +24,22 @@ export function errMsg(e) {
   return e?.response?.data?.message || e?.message || 'Something went wrong';
 }
 
+/**
+ * Downloads an authenticated file endpoint as a blob and triggers a save.
+ * `url` is relative to /api, e.g. '/administration/export/users'.
+ */
+export async function downloadFile(url, filename) {
+  const res = await api.get(url, { responseType: 'blob' });
+  const href = URL.createObjectURL(res.data);
+  const a = document.createElement('a');
+  a.href = href;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(href);
+}
+
 api.interceptors.response.use(
   (res) => res,
   async (err) => {

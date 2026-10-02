@@ -1,4 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { getToken } from '../api';
 
 // ---------- Toast ----------
 const ToastCtx = createContext(null);
@@ -107,6 +108,18 @@ const STATUS_LABELS = {
   sent: ['blue', 'Sent'], part_paid: ['amber', 'Part Paid'], overdue: ['red', 'Overdue'], reimbursed: ['green', 'Reimbursed'],
   open: ['blue', 'Open'], in_progress: ['amber', 'In Progress'], resolved: ['green', 'Resolved'], closed: ['gray', 'Closed'], reopened: ['red', 'Reopened'],
   assigned: ['blue', 'Assigned'], available: ['green', 'Available'], repair: ['amber', 'Repair'], retired: ['gray', 'Retired'],
+  // v2
+  investigating: ['purple', 'Investigating'], credited: ['green', 'Credited'], completed: ['green', 'Completed'],
+  reviewing: ['amber', 'Reviewing'], implemented: ['green', 'Implemented'], issued: ['blue', 'Issued'],
+  settled: ['green', 'Settled'], not_required: ['gray', 'No Settlement'], advanced: ['blue', 'Advanced'],
+  ready_now: ['green', 'Ready now'], ready_1_2_years: ['amber', 'Ready in 1-2 yrs'], ready_3_5_years: ['amber', 'Ready in 3-5 yrs'], not_ready: ['red', 'Not ready'],
+  critical: ['red', 'Critical'], high: ['red', 'High'], medium: ['amber', 'Medium'], low: ['green', 'Low'],
+  beginner: ['gray', 'Beginner'], intermediate: ['blue', 'Intermediate'], advanced_: ['green', 'Advanced'], expert: ['purple', 'Expert'],
+  running: ['blue', 'Running'], failed: ['red', 'Failed'], skipped: ['gray', 'Skipped'],
+  success: ['green', 'Success'], dead: ['red', 'Dead'], connected: ['green', 'Connected'], disabled: ['gray', 'Disabled'], error: ['red', 'Error'],
+  applied: ['green', 'Applied'], promoted: ['purple', 'Promoted'], rewarded: ['purple', 'Rewarded'], referred: ['blue', 'Referred'],
+  answered: ['green', 'Answered'], pending_approval: ['amber', 'Pending Approval'], blocked: ['red', 'Blocked'],
+  anonymous: ['gray', 'Anonymous'], named: ['blue', 'Named'], suspension: ['red', 'Suspension'], pip: ['amber', 'PIP'],
 };
 export function StatusBadge({ value, labels }) {
   const map = { ...STATUS_LABELS, ...(labels || {}) };
@@ -190,8 +203,14 @@ export function Donut({ data, size = 150 }) {
 
 // ---------- File download helper ----------
 export async function downloadFile(url, filename) {
-  const res = await fetch(url, { credentials: 'include' });
-  if (!res.ok) throw new Error('Download failed');
+  // The API authenticates via the Authorization header only — cookies alone are not
+  // accepted — so the bearer token has to ride along or every export 401s.
+  const token = getToken();
+  const res = await fetch(url, {
+    credentials: 'include',
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  if (!res.ok) throw new Error(`Download failed (${res.status})`);
   const blob = await res.blob();
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
