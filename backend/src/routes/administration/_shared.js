@@ -14,14 +14,41 @@ const { logAudit } = require('../../services/audit');
 const { requirePermission } = require('../../middleware/auth');
 
 /**
- * The tenant a read may address. Derived from the session; a platform super
- * admin may look across companies, but only when it names one explicitly.
+ * The tenant a read may address. Derived from the session; a platform operator
+ * may look across companies, but only when it names one explicitly.
+ *
+ * Naming a company other than the caller's own requires a live support-access
+ * session; the check is asynchronous, so cross-tenant reads use `resolveTenantId`.
  */
 function tenantId(req) {
   if (req.user.isPlatformAdmin) {
     const asked = req.query.tenant_id ?? req.body?.tenant_id;
     if (asked !== undefined && asked !== null && asked !== '') return Number(asked);
     return req.user.tenant_id ?? null;
+  }
+  if (req.user.tenant_id == null) throw new HttpError(403, 'Your account is not bound to a company');
+  assertOwnTenant(req);
+  return req.user.tenant_id;
+}
+
+/**
+ * Async form of `tenantId` that also enforces Support Access (spec §21).
+ * Every route that can address another company uses this instead.
+ */
+async function resolveTenantId(req, { required = false } = {}) {
+  const asked = req.query?.tenant_id ?? req.body?.tenant_id;
+  if (req.user.isPlatformAdmin) {
+    if (asked === undefined || asked === null || asked === '') {
+      if (required && req.user.tenant_id == null) {
+        throw new HttpError(400, 'tenant_id is required when acting as the platform administrator');
+      }
+      return req.user.tenant_id ?? null;
+    }
+    if (req.user.tenant_id != null && Number(asked) === Number(req.user.tenant_id)) return Number(asked);
+    const supportAccess = require('../../services/supportAccess');
+    const reach = await supportAccess.assertTenantReach(req.user, Number(asked));
+    req.supportSession = reach.session || null;
+    return Number(asked);
   }
   if (req.user.tenant_id == null) throw new HttpError(403, 'Your account is not bound to a company');
   assertOwnTenant(req);
@@ -55,6 +82,19 @@ function writeTenantId(req) {
   if (req.user.tenant_id == null) throw new HttpError(403, 'Your account is not bound to a company');
   assertOwnTenant(req);
   return req.user.tenant_id;
+}
+
+/** Write form of `resolveTenantId` — a platform operator must name the company. */
+async function resolveWriteTenantId(req) {
+  const asked = req.body?.tenant_id ?? req.query?.tenant_id;
+  if (req.user.isPlatformAdmin && asked !== undefined && asked !== null && asked !== '') {
+    if (req.user.tenant_id != null && Number(asked) === Number(req.user.tenant_id)) return Number(asked);
+    const supportAccess = require('../../services/supportAccess');
+    const reach = await supportAccess.assertTenantReach(req.user, Number(asked));
+    req.supportSession = reach.session || null;
+    return Number(asked);
+  }
+  return writeTenantId(req);
 }
 
 const MODULE = 'administration';
@@ -248,6 +288,6 @@ const SOFT_DATE_COLUMNS = new Set(['departments.archived_at', 'custom_forms.publ
 
 module.exports = {
   insertRows,
-  tenantId, writeTenantId, audit, int, bool, j, unj, paging, crud, decode,
+  tenantId, writeTenantId, resolveTenantId, resolveWriteTenantId, audit, int, bool, j, unj, paging, crud, decode,
   assertUnique, MODULE, now,
 };

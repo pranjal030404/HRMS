@@ -29,16 +29,21 @@ function parseCsv(text) {
   return rows;
 }
 
-/** rows: array of objects; columns: [{key, header}] */
-function toCsv(rows, columns) {
+/**
+ * rows: array of objects; columns: [{key, header}]
+ *
+ * `header: false` omits the header row, which is what a streaming caller needs when
+ * it has already written the header once and is appending page after page.
+ */
+function toCsv(rows, columns, { header = true } = {}) {
   const esc = (v) => {
     if (v === null || v === undefined) return '';
     const s = String(v);
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
   const head = columns.map((c) => esc(c.header)).join(',');
   const body = rows.map((r) => columns.map((c) => esc(typeof c.get === 'function' ? c.get(r) : r[c.key])).join(','));
-  return [head, ...body].join('\n');
+  return header ? [head, ...body].join('\n') : body.join('\n');
 }
 
 module.exports = { parseCsv, toCsv };

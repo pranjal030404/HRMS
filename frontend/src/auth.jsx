@@ -13,11 +13,16 @@ export function AuthProvider({ children }) {
       const { data } = await api.get('/auth/me');
       data.data.employee_id = data.data.employeeId; // normalize for convenience
       setMe(data.data);
-      // white-label branding → CSS variables
+      // White-label branding → CSS variables. A platform operator has no tenant
+      // branding, so this is skipped rather than blanking the theme.
       const b = data.data.branding || {};
-      if (b.primaryColor) document.documentElement.style.setProperty('--primary', b.primaryColor);
-      if (b.primaryColor) document.documentElement.style.setProperty('--primary-dark', b.primaryColor);
-      document.title = (b.companyName || 'Arthvex') + ' HRMS';
+      if (b.primaryColor) {
+        document.documentElement.style.setProperty('--primary', b.primaryColor);
+        document.documentElement.style.setProperty('--primary-dark', b.primaryColor);
+      }
+      document.title = data.data.isPlatformAdmin
+        ? 'ARTHVEX Platform'
+        : `${b.companyName || 'Arthvex'} HRMS`;
       return data.data;
     } catch (_) {
       setMe(null);
@@ -59,14 +64,20 @@ export function AuthProvider({ children }) {
     setMe(null);
   };
 
+  // A platform operator is judged by the permissions the server resolved for the
+  // *specific* platform role they hold. Only the Platform Super Admin bypasses,
+  // because it is the role that is allowed to administer the platform as a whole —
+  // it still holds no tenant HRMS permission (that is what Support Access is for).
   const can = (perm) => {
     if (!me) return false;
-    if (me.role === 'platform_super_admin') return true;
     if (!perm) return true;
-    if (me.permissions.includes(perm)) return true;
-    const [base, scope] = perm.split(':');
-    if (scope) return me.permissions.includes(base);
-    return me.permissions.some((p) => p === base || p.startsWith(base + ':'));
+    if (me.isPlatformSuperAdmin) return true;
+    if (!me.permissions.includes(perm)) {
+      const [base, scope] = perm.split(':');
+      if (scope && me.permissions.includes(base)) return true;
+      return false;
+    }
+    return true;
   };
 
   // Switching a module off in the Administration Center detaches its routes on the
@@ -76,16 +87,32 @@ export function AuthProvider({ children }) {
   // same resolver the API uses, so the two can never disagree.
   const moduleOn = (key) => {
     if (!me) return false;
-    if (me.role === 'platform_super_admin') return true;
     if (!key) return true;
     const list = me.accessibleModules;
     if (!Array.isArray(list)) return true; // no answer to check against — let the API decide
     return list.includes(key);
   };
 
-  return (
-    <Ctx.Provider value={{ me, loading, login, completeMfaLogin, logout, can, moduleOn, refreshMe }}>
-      {children}
-    </Ctx.Provider>
-  );
+  /**
+   * What a feature is currently allowed to do for this company, read from the
+   * server's own entitlement resolution. Returns one of:
+   *   'on' | 'off' | 'excluded' | 'limit' | 'suspended'
+   * The UI uses it to explain an unavailable feature (spec §35); the server
+   * re-checks every one of these independently on the write path.
+   */
+  const entitlement = (key) => {
+    const e = me?.entitlements?.[key];
+    if (!e) return { state: 'unknown', value: null };
+    if (e.kind === 'boolean') return { state: e.value ? 'on' : 'excluded', value: e.value };
+    if (me.tenantReadOnly) return { state: 'suspended', value: e.value, current: e.current };
+    if (e.value === 0) return { state: 'excluded', value: 0 };
+    return { state: 'on', value: e.value, unit: e.unit, source: e.source };
+  };
+
+  const value = {
+    me, loading, login, completeMfaLogin, logout, can, moduleOn, refreshMe, entitlement,
+    isPlatform: !!me?.isPlatformAdmin,
+    isPlatformSuperAdmin: !!me?.isPlatformSuperAdmin,
+  };
+  return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

@@ -162,17 +162,46 @@ async function punch({ tenantId, employee, source = 'web', when = null }) {
 }
 
 /** LOP days for an employee in a month: unpaid-leave full days + absents + half-day halves. */
+/**
+ * Unpaid-leave days that fall inside [start, end] for a set of approved requests.
+ *
+ * A request spanning two months used to be charged in full to BOTH of them (the whole
+ * `days` figure, whenever the range merely overlapped). The per-day breakdown is used when
+ * present; otherwise the request is pro-rated by calendar overlap.
+ */
+function unpaidLeaveDaysInRange(requests, start, end) {
+  const day = (d) => new Date(`${String(d).slice(0, 10)}T00:00:00Z`).getTime();
+  const lo = day(start); const hi = day(end);
+  let total = 0;
+  for (const r of requests) {
+    let breakdown = r.day_breakdown;
+    if (typeof breakdown === 'string') { try { breakdown = JSON.parse(breakdown); } catch { breakdown = null; } }
+    if (Array.isArray(breakdown) && breakdown.length) {
+      for (const b of breakdown) {
+        const t = day(b.date);
+        if (t >= lo && t <= hi && (b.kind === undefined || b.kind === 'working')) total += Number(b.value ?? 1);
+      }
+      continue;
+    }
+    const s = day(r.start_date); const e = day(r.end_date);
+    const span = Math.round((e - s) / 86400000) + 1;
+    const overlap = Math.round((Math.min(e, hi) - Math.max(s, lo)) / 86400000) + 1;
+    if (overlap > 0 && span > 0) total += (Number(r.days || 0) * Math.min(overlap, span)) / span;
+  }
+  return Math.round(total * 100) / 100;
+}
+
 async function lopForMonth(tenantId, employeeId, year, month) {
   const { start, end } = require('../utils/helpers').monthRange(year, month);
   let lop = 0;
   const [unpaid] = await pool.query(
-    `SELECT COALESCE(SUM(lr.days),0) AS d FROM leave_requests lr
+    `SELECT lr.start_date, lr.end_date, lr.days, lr.day_breakdown FROM leave_requests lr
      JOIN leave_types lt ON lt.id = lr.leave_type_id
      WHERE lr.tenant_id = ? AND lr.employee_id = ? AND lr.status = 'approved' AND lt.is_paid = 0
        AND lr.start_date <= ? AND lr.end_date >= ?`,
     [tenantId, employeeId, end, start]
   );
-  lop += Number(unpaid[0].d || 0);
+  lop += unpaidLeaveDaysInRange(unpaid, start, end);
   const [abs] = await pool.query(
     `SELECT status, COUNT(*) AS n FROM attendance_records
      WHERE tenant_id = ? AND employee_id = ? AND adate BETWEEN ? AND ? AND status IN ('absent','half_day')
@@ -180,7 +209,8 @@ async function lopForMonth(tenantId, employeeId, year, month) {
     [tenantId, employeeId, start, end]
   );
   for (const a of abs) lop += a.status === 'absent' ? Number(a.n) : Number(a.n) * 0.5;
-  return Math.min(lop, 30);
+  return Math.min(lop, 31);
 }
 
-module.exports = { punch, resolveDay, getShiftForEmployee, isHoliday, weeklyOffSet, lopForMonth, DAY_INDEX };
+module.exports = {
+  unpaidLeaveDaysInRange, punch, resolveDay, getShiftForEmployee, isHoliday, weeklyOffSet, lopForMonth, DAY_INDEX };

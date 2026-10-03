@@ -254,7 +254,11 @@ async function effectivePermissions(user) {
     // so the honest answer for one is the whole catalog — even when the account is
     // bound to a company whose admin has switched a module off. Reporting the tenant's
     // enabled set instead would make the UI hide a screen the API still answers.
-    accessibleModules: await enabledModules(user.role === 'platform_super_admin' ? null : user.tenant_id),
+    // The *other* platform roles have no company, so they likewise see nothing:
+    // reaching a customer's modules is what a support-access session is for.
+    accessibleModules: await enabledModules(
+      user.tenant_id == null || user.role === 'platform_super_admin' ? null : user.tenant_id
+    ),
   };
   userCache.set(cacheKey, { at: Date.now(), effective, tenantId: user.tenant_id });
   return effective;

@@ -4,7 +4,7 @@ const { pool } = require('../config/db');
 const { asyncH, HttpError } = require('../utils/helpers');
 const { authenticate, requirePermission, employeeScopeCondition } = require('../middleware/auth');
 const { logAudit } = require('../services/audit');
-const { upload, relPath } = require('../middleware/upload');
+const { upload, relPath, discardUpload } = require('../middleware/upload');
 const { generateLetterPdf } = require('../services/pdf');
 const { getSetting } = require('../services/settings');
 
@@ -21,17 +21,31 @@ r.get('/employee/:employeeId', requirePermission('document.view'), asyncH(async 
 
 r.post('/employee/:employeeId', requirePermission('document.view'), upload('documents'), asyncH(async (req, res) => {
   if (!req.file) throw new HttpError(400, 'File required');
-  const { docType, name, issuedOn, expiresOn } = req.body || {};
-  const target = Number(req.params.employeeId);
-  const isSelf = Number(req.user.employee_id) === target;
-  const isUploader = req.user.permissions.includes('document.manage');
-  if (!isSelf && !isUploader) throw new HttpError(403, 'Not allowed');
-  const [ins] = await pool.query(
-    `INSERT INTO employee_documents (tenant_id, employee_id, doc_type, name, file_path, mime_type, size_bytes, issued_on, expires_on, uploaded_by)
-     VALUES (?,?,?,?,?,?,?,?,?,?)`,
-    [req.user.tenant_id, target, docType || 'other', name || req.file.originalname, relPath(req.file), req.file.mimetype, req.file.size, issuedOn || null, expiresOn || null, req.user.id]
-  );
-  res.status(201).json({ data: { id: ins.insertId } });
+  // The bytes are already on disk at this point, so every rejection below has to take
+  // the file with it — otherwise a refused upload silently consumes the tenant's
+  // storage while their usage meter still reports them under the limit.
+  try {
+    const { docType, name, issuedOn, expiresOn } = req.body || {};
+    const target = Number(req.params.employeeId);
+    const isSelf = Number(req.user.employee_id) === target;
+    const isUploader = req.user.permissions.includes('document.manage');
+    if (!isSelf && !isUploader) throw new HttpError(403, 'Not allowed');
+    // The employee vault draws on the same tenant storage allowance as the company
+    // library (spec §14).
+    await require('../services/limits').assertWithinLimit({
+      tenantId: req.user.tenant_id, entitlementKey: 'storage.max_gb',
+      incoming: req.file.size / (1024 ** 3), action: 'employee_document.upload', req,
+    });
+    const [ins] = await pool.query(
+      `INSERT INTO employee_documents (tenant_id, employee_id, doc_type, name, file_path, mime_type, size_bytes, issued_on, expires_on, uploaded_by)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      [req.user.tenant_id, target, docType || 'other', name || req.file.originalname, relPath(req.file), req.file.mimetype, req.file.size, issuedOn || null, expiresOn || null, req.user.id]
+    );
+    res.status(201).json({ data: { id: ins.insertId } });
+  } catch (e) {
+    if (!res.headersSent) discardUpload(req.file);
+    throw e;
+  }
 }));
 
 r.post('/employee-docs/:id/verify', requirePermission('document.manage'), asyncH(async (req, res) => {
@@ -62,16 +76,36 @@ r.get('/company', asyncH(async (req, res) => {
   res.json({ data: rows.map((x) => ({ ...x, acknowledged: ackSet.has(x.id) })) });
 }));
 
-r.post('/company', requirePermission('document.manage'), upload('documents'), asyncH(async (req, res) => {
-  const { title, category, description, requiresAck, version } = req.body || {};
-  if (!title) throw new HttpError(400, 'Title required');
-  const [ins] = await pool.query(
-    `INSERT INTO company_documents (tenant_id, title, category, description, file_path, version, requires_ack, published_at, created_by)
-     VALUES (?,?,?,?,?,?,?,NOW(),?)`,
-    [req.user.tenant_id, title, category || 'policy', description || null, req.file ? relPath(req.file) : null, version || '1.0', requiresAck === 'true' || requiresAck === true ? 1 : 0, req.user.id]
-  );
-  res.status(201).json({ data: { id: ins.insertId } });
-}));
+r.post('/company', requirePermission('document.manage'), upload('documents'), asyncH(require('../services/limits').locked('document.upload', async (req, res) => {
+  // Same rule as the employee vault: multer has already written the file, so a
+  // refusal here must not leave it behind.
+  try {
+    const { title, category, description, requiresAck, version } = req.body || {};
+    if (!title) throw new HttpError(400, 'Title required');
+    // Two caps, both enforced here (spec §14): the file *count* and the total
+    // bytes held. `incoming` is the file's real size so a single large upload is
+    // refused against storage rather than being allowed to cross the cap and then
+    // tripping it on the next request.
+    const limits = require('../services/limits');
+    await limits.assertWithinLimit({
+      tenantId: req.user.tenant_id, entitlementKey: 'documents.stored', incoming: 1, action: 'document.upload', req,
+    });
+    await limits.assertWithinLimit({
+      tenantId: req.user.tenant_id, entitlementKey: 'storage.max_gb',
+      incoming: req.file ? (req.file.size / (1024 ** 3)) : 0, action: 'document.upload', req,
+    });
+    const [ins] = await pool.query(
+      `INSERT INTO company_documents (tenant_id, title, category, description, file_path, file_size, version, requires_ack, published_at, created_by)
+       VALUES (?,?,?,?,?,?,?,?,NOW(),?)`,
+      [req.user.tenant_id, title, category || 'policy', description || null, req.file ? relPath(req.file) : null,
+        req.file ? req.file.size : 0, version || '1.0', requiresAck === 'true' || requiresAck === true ? 1 : 0, req.user.id]
+    );
+    res.status(201).json({ data: { id: ins.insertId } });
+  } catch (e) {
+    if (!res.headersSent) discardUpload(req.file);
+    throw e;
+  }
+})));
 
 r.post('/company/:id/acknowledge', asyncH(async (req, res) => {
   await pool.query(

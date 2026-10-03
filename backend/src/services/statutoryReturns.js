@@ -78,6 +78,9 @@ async function pfEcr(tenantId, period) {
       pfWages: money(s.pfWage),
       epsContribution: money(s.pfEps),
       epfContribution: money(s.pfEmployee),
+      // The employer's 12% is split: 8.33% to EPS and the rest to the EPF account. Only the
+      // EPS half was ever remitted here, so the return under-stated what is owed.
+      employerEpfShare: round2(Math.max(0, Number(s.pfEmployer || 0) - Number(s.pfEps || 0))),
       edliContribution: 0,
       refundOfAdvances: 0,
       month: `${r.period_year}-${String(r.period_month).padStart(2, '0')}`,
@@ -97,10 +100,11 @@ async function pfEcr(tenantId, period) {
       epsContribution: sum('epsContribution'),
       epfContribution: sum('epfContribution'),
       edliContribution: sum('edliContribution'),
-      // Employer PF remittance = EPS + EDLI (the employee's 12% share is withheld from salary)
-      employerLiability: round2(sum('epsContribution') + sum('edliContribution')),
+      employerEpfShare: sum('employerEpfShare'),
+      // Employer liability = EPS + the employer's EPF share + EDLI (the employee's share is withheld from salary).
+      employerLiability: round2(sum('epsContribution') + sum('employerEpfShare') + sum('edliContribution')),
       employeeWithheld: sum('epfContribution'),
-      totalRemittance: round2(sum('epsContribution') + sum('edliContribution') + sum('epfContribution')),
+      totalRemittance: round2(sum('epsContribution') + sum('employerEpfShare') + sum('edliContribution') + sum('epfContribution')),
     },
   };
 }

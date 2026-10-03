@@ -10,13 +10,29 @@ CREATE TABLE IF NOT EXISTS tenants (
   id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
   name VARCHAR(160) NOT NULL,
   slug VARCHAR(80) NOT NULL UNIQUE,
+  display_name VARCHAR(160) NULL,              -- what the workspace calls itself, may differ from the legal name
   plan VARCHAR(40) DEFAULT 'standard',
-  status ENUM('active','suspended') DEFAULT 'active',
+  -- Tenant lifecycle (spec §27). Deliberately wider than the original active/suspended
+  -- pair; migrate.js widens this in place so existing databases keep their values.
+  status ENUM('provisioning','trial','active','past_due','grace_period','suspended','cancelled','archived','deletion_pending','deleted') DEFAULT 'active',
+  industry VARCHAR(80) NULL,
+  country VARCHAR(2) DEFAULT 'IN',
+  timezone VARCHAR(64) DEFAULT 'Asia/Kolkata',
+  currency VARCHAR(8) DEFAULT 'INR',
+  contact_email VARCHAR(190) NULL,
+  contact_phone VARCHAR(30) NULL,
   branding JSON,                -- {logoUrl, primaryColor, companyName, supportEmail, loginTagline}
-  feature_flags JSON,           -- {recruitment:true, performance:true, billing:false, ...}
-  employee_limit INT UNSIGNED DEFAULT 200,
+  feature_flags JSON,           -- release flags, NOT entitlements (spec §9)
+  employee_limit INT UNSIGNED DEFAULT 200,      -- legacy mirror; the authoritative cap is the employees.max entitlement
+  limits JSON NULL,                            -- legacy per-tenant cap overrides kept for back-compat
+  onboarded_at DATETIME NULL,
+  suspended_at DATETIME NULL,
+  archived_at DATETIME NULL,
+  deletion_scheduled_at DATETIME NULL,
+  last_activity_at DATETIME NULL,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  KEY idx_tenants_status (status)
 );
 
 CREATE TABLE IF NOT EXISTS roles (
@@ -1053,8 +1069,15 @@ CREATE TABLE IF NOT EXISTS legal_entities (
   name VARCHAR(190) NOT NULL,
   code VARCHAR(30),
   entity_type ENUM('company','llp','partnership','proprietorship') DEFAULT 'company',
-  cin VARCHAR(40), pan VARCHAR(20), gstin VARCHAR(20),
-  address VARCHAR(255), city VARCHAR(80), state VARCHAR(80),
+  -- Statutory identifiers. A tenant is NOT a legal entity (spec §6): one customer
+  -- may run payroll across several of these, each with its own registrations.
+  cin VARCHAR(40), pan VARCHAR(20), gstin VARCHAR(20), tan VARCHAR(20),
+  address VARCHAR(255), address_line1 VARCHAR(255), city VARCHAR(80), state VARCHAR(80),
+  state_code VARCHAR(8), pincode VARCHAR(12),
+  bank_name VARCHAR(120), bank_account_enc VARBINARY(512), bank_ifsc VARCHAR(20),
+  pf_code VARCHAR(40), esi_code VARCHAR(40), pt_state VARCHAR(8),
+  pt_configuration JSON NULL,
+  is_primary TINYINT(1) DEFAULT 0,
   status ENUM('active','inactive') DEFAULT 'active',
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -2322,13 +2345,19 @@ CREATE TABLE IF NOT EXISTS platform_plans (
   plan_key VARCHAR(40) NOT NULL,
   name VARCHAR(80) NOT NULL,
   description VARCHAR(255),
+  plan_type ENUM('trial','standard','premium','custom') DEFAULT 'standard',
+  is_public TINYINT(1) DEFAULT 1,              -- sellable in the provisioning wizard
   price_monthly DECIMAL(12,2) DEFAULT 0,
+  -- Legacy mirror. The authoritative caps now live in plan_entitlements; these stay
+  -- populated so pre-existing screens and integrations keep working.
   employee_limit INT UNSIGNED DEFAULT 200,
   module_keys JSON NULL,                       -- null = all modules
   feature_limits JSON NULL,
+  trial_days INT UNSIGNED DEFAULT 0,
   active TINYINT(1) DEFAULT 1,
   sort_order INT UNSIGNED DEFAULT 100,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY uq_plan (plan_key)
 );
 
@@ -2355,6 +2384,546 @@ CREATE TABLE IF NOT EXISTS company_onboarding (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY uq_onboarding (tenant_id)
+);
+
+-- ============================================================
+-- PLATFORM CONTROL PLANE
+--
+-- The layer above tenants. Everything here is cross-tenant by construction and
+-- has no `tenant_id` unless the row is *about* one company:
+--
+--   entitlements → the metered/boolean capabilities the product can grant
+--   plan_entitlements → what each plan provides by default
+--   tenant_entitlement_overrides → a tenant's bespoke, time-boxed deviation
+--   subscriptions → the commercial relationship and its lifecycle state
+--   tenant_usage / usage_events → what the tenant actually consumes
+--   support_access_sessions/logs → time-limited, auditable tenant access
+--   platform_audit_logs → append-only record of control-plane decisions
+--
+-- Nothing here duplicates HRMS data. Limits are resolved by
+-- `services/entitlements`, which is the only place the layering happens.
+-- ============================================================
+
+-- ---------- Entitlement catalogue ----------
+-- The full list of things a plan can grant. `kind` decides how the value is
+-- evaluated: boolean features are on/off, numeric entitlements are caps, and
+-- metered entitlements are caps that reset on a period.
+CREATE TABLE IF NOT EXISTS entitlements (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  entitlement_key VARCHAR(80) NOT NULL,            -- employees.max, payroll.enabled, api.requests.month
+  name VARCHAR(160) NOT NULL,
+  description VARCHAR(500) NULL,
+  kind ENUM('boolean','numeric','metered') NOT NULL DEFAULT 'numeric',
+  module_key VARCHAR(60) NULL,                     -- NULL = platform-wide, not tied to one module
+  scope ENUM('platform','tenant') DEFAULT 'tenant',
+  period ENUM('none','day','month','year') DEFAULT 'none',
+  default_value VARCHAR(190) NULL,                 -- used when no plan defines the key
+  unit VARCHAR(30) NULL,                           -- employees, gb, requests, keys, …
+  unit_label VARCHAR(40) NULL,
+  warning_pct TINYINT UNSIGNED DEFAULT 80,
+  critical_pct TINYINT UNSIGNED DEFAULT 90,
+  is_platform_available TINYINT(1) DEFAULT 1,       -- ARTHVEX itself can still turn this off
+  sort_order INT UNSIGNED DEFAULT 100,
+  is_system TINYINT(1) DEFAULT 1,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_entitlement (entitlement_key)
+);
+
+-- What each plan grants by default. A plan never hard-codes limits in code —
+-- this table is the plan editor's backing store.
+CREATE TABLE IF NOT EXISTS plan_entitlements (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  plan_id BIGINT UNSIGNED NOT NULL,
+  entitlement_id BIGINT UNSIGNED NOT NULL,
+  value VARCHAR(190) NOT NULL,                     -- '1' / '0' or a number
+  effective_from DATETIME NULL,
+  effective_until DATETIME NULL,
+  created_by BIGINT UNSIGNED NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_plan_entitlement (plan_id, entitlement_id),
+  KEY idx_pe_plan (plan_id)
+);
+
+-- A tenant's deviation from its plan. Temporary overrides (effective_until in the
+-- past) simply stop applying — they are never deleted, so the history of who
+-- raised a limit and why survives.
+CREATE TABLE IF NOT EXISTS tenant_entitlement_overrides (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  tenant_id BIGINT UNSIGNED NOT NULL,
+  entitlement_id BIGINT UNSIGNED NOT NULL,
+  value VARCHAR(190) NOT NULL,
+  reason VARCHAR(500) NULL,
+  status ENUM('active','revoked','expired') DEFAULT 'active',
+  approved_by BIGINT UNSIGNED NULL,
+  approved_at DATETIME NULL,
+  effective_from DATETIME NULL,
+  effective_until DATETIME NULL,
+  created_by BIGINT UNSIGNED NULL,
+  revoked_by BIGINT UNSIGNED NULL,
+  revoked_at DATETIME NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_tenant_override (tenant_id, entitlement_id, effective_from),
+  KEY idx_teo_tenant (tenant_id, status)
+);
+
+-- ---------- Subscriptions ----------
+-- The commercial relationship. Deliberately separate from `tenants.status`:
+-- a tenant can be archived while still holding a live subscription record, and
+-- a subscription can be past due while the tenant keeps working during grace.
+CREATE TABLE IF NOT EXISTS subscriptions (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  tenant_id BIGINT UNSIGNED NOT NULL,
+  plan_id BIGINT UNSIGNED NULL,
+  plan_key VARCHAR(40) NOT NULL,                   -- denormalised so history survives plan edits
+  status ENUM('trialing','active','past_due','grace_period','suspended','cancelled','expired') NOT NULL DEFAULT 'trialing',
+  billing_cycle ENUM('monthly','quarterly','annual','custom') DEFAULT 'monthly',
+  quantity INT UNSIGNED DEFAULT 0,                 -- seats sold, where the plan is per-seat
+  currency VARCHAR(8) DEFAULT 'INR',
+  price_per_period DECIMAL(12,2) DEFAULT 0,
+  discount_pct DECIMAL(5,2) DEFAULT 0,
+  trial_ends_at DATETIME NULL,
+  current_period_start DATETIME NULL,
+  current_period_end DATETIME NULL,
+  grace_ends_at DATETIME NULL,                     -- non-null only while past due
+  suspended_at DATETIME NULL,
+  cancelled_at DATETIME NULL,
+  cancel_at_period_end TINYINT(1) DEFAULT 0,
+  auto_renew TINYINT(1) DEFAULT 1,
+  external_ref VARCHAR(120) NULL,                  -- payment provider invoice/subscription id
+  notes VARCHAR(500) NULL,
+  created_by BIGINT UNSIGNED NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  KEY idx_sub_tenant (tenant_id, status)
+);
+
+-- Append-only subscription lifecycle history. Every transition is recorded here
+-- as well as in platform_audit_logs, because billing reconciles against this.
+CREATE TABLE IF NOT EXISTS subscription_events (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  subscription_id BIGINT UNSIGNED NOT NULL,
+  tenant_id BIGINT UNSIGNED NOT NULL,
+  event_type VARCHAR(60) NOT NULL,                 -- created, activated, renewed, past_due, …
+  from_status VARCHAR(30) NULL,
+  to_status VARCHAR(30) NULL,
+  amount DECIMAL(12,2) NULL,
+  reason VARCHAR(500) NULL,
+  actor_user_id BIGINT UNSIGNED NULL,
+  actor_name VARCHAR(120) NULL,
+  metadata JSON NULL,
+  request_id VARCHAR(64) NULL,
+  ip VARCHAR(64) NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_subev_sub (subscription_id, created_at),
+  KEY idx_subev_tenant (tenant_id, created_at)
+);
+
+-- ---------- Platform billing: what ARTHVEX invoices a customer ----------
+-- Distinct from `invoices` (a tenant's own customer billing module). These are
+-- ARTHVEX's financial records, so they outlive a tenant purge like the audit trail.
+CREATE TABLE IF NOT EXISTS subscription_invoices (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  tenant_id BIGINT UNSIGNED NOT NULL,
+  subscription_id BIGINT UNSIGNED NOT NULL,
+  invoice_number VARCHAR(40) NOT NULL,
+  period_start DATE NOT NULL,
+  period_end DATE NOT NULL,
+  currency VARCHAR(8) DEFAULT 'INR',
+  subtotal DECIMAL(12,2) NOT NULL DEFAULT 0,
+  discount DECIMAL(12,2) NOT NULL DEFAULT 0,
+  tax_pct DECIMAL(5,2) NOT NULL DEFAULT 0,
+  tax DECIMAL(12,2) NOT NULL DEFAULT 0,
+  total DECIMAL(12,2) NOT NULL DEFAULT 0,
+  amount_paid DECIMAL(12,2) NOT NULL DEFAULT 0,
+  status ENUM('open','paid','void') NOT NULL DEFAULT 'open',
+  due_at DATE NULL,
+  paid_at DATETIME NULL,
+  voided_at DATETIME NULL,
+  void_reason VARCHAR(500) NULL,
+  notes VARCHAR(500) NULL,
+  created_by BIGINT UNSIGNED NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_sub_invoice_number (invoice_number),
+  UNIQUE KEY uq_sub_invoice_period (subscription_id, period_start, period_end),
+  KEY idx_sub_invoice_tenant (tenant_id, status)
+);
+
+CREATE TABLE IF NOT EXISTS subscription_payments (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  tenant_id BIGINT UNSIGNED NOT NULL,
+  invoice_id BIGINT UNSIGNED NOT NULL,
+  amount DECIMAL(12,2) NOT NULL,
+  method ENUM('bank_transfer','card','upi','cheque','cash','other') NOT NULL DEFAULT 'bank_transfer',
+  reference VARCHAR(120) NULL,
+  received_at DATETIME NOT NULL,
+  note VARCHAR(500) NULL,
+  recorded_by BIGINT UNSIGNED NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_sub_pay_invoice (invoice_id),
+  KEY idx_sub_pay_tenant (tenant_id, received_at)
+);
+
+-- ---------- Usage metering ----------
+-- Current counter per tenant per entitlement. Rebuilt from source on demand
+-- (`usage.recompute`) and nudged incrementally by the metered paths.
+CREATE TABLE IF NOT EXISTS tenant_usage (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  tenant_id BIGINT UNSIGNED NOT NULL,
+  entitlement_id BIGINT UNSIGNED NOT NULL,
+  period_key VARCHAR(20) NOT NULL,                 -- 'lifetime', '2026-10', …
+  current_value BIGINT DEFAULT 0,
+  peak_value BIGINT DEFAULT 0,
+  last_computed_at DATETIME NULL,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_usage (tenant_id, entitlement_id, period_key),
+  KEY idx_usage_tenant (tenant_id)
+);
+
+-- Every increment, so a dispute over "how did we reach 100,000 API calls" is
+-- answerable rather than a matter of faith in the counter row.
+CREATE TABLE IF NOT EXISTS usage_events (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  tenant_id BIGINT UNSIGNED NOT NULL,
+  entitlement_id BIGINT UNSIGNED NOT NULL,
+  delta BIGINT NOT NULL,
+  period_key VARCHAR(20) NOT NULL,
+  source VARCHAR(60) NOT NULL,                     -- request, job, seed, recompute, adjustment
+  reference_type VARCHAR(60) NULL,
+  reference_id VARCHAR(64) NULL,
+  actor_user_id BIGINT UNSIGNED NULL,
+  request_id VARCHAR(64) NULL,
+  metadata JSON NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_usageev_tenant (tenant_id, entitlement_id, created_at),
+  KEY idx_usageev_period (tenant_id, period_key)
+);
+
+-- ---------- Support access ----------
+-- Temporary, reason-bearing, auto-expiring access a platform operator takes into
+-- one tenant's data. There is no "permanent" row: `expires_at` is NOT NULL and
+-- every read under an active session is written to support_access_logs.
+CREATE TABLE IF NOT EXISTS support_access_sessions (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  tenant_id BIGINT UNSIGNED NOT NULL,
+  granted_by BIGINT UNSIGNED NOT NULL,
+  granted_by_name VARCHAR(120) NULL,
+  reason VARCHAR(500) NOT NULL,
+  ticket_ref VARCHAR(80) NULL,
+  access_type ENUM('read_only','tenant_administration','configuration') DEFAULT 'read_only',
+  scope_json JSON NULL,                            -- optional module narrowing
+  status ENUM('pending','active','expired','revoked') DEFAULT 'active',
+  requires_approval TINYINT(1) DEFAULT 0,        -- 1 => created 'pending', needs a second operator
+  approved_by BIGINT UNSIGNED NULL,
+  approved_at DATETIME NULL,
+  expires_at DATETIME NOT NULL,
+  revoked_at DATETIME NULL,
+  revoked_reason VARCHAR(500) NULL,
+  ip VARCHAR(64) NULL,
+  user_agent VARCHAR(255) NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_sas_tenant (tenant_id, status, expires_at),
+  KEY idx_sas_granted_by (granted_by)
+);
+
+-- One row per action taken while a support session was active.
+CREATE TABLE IF NOT EXISTS support_access_logs (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  session_id BIGINT UNSIGNED NOT NULL,
+  tenant_id BIGINT UNSIGNED NOT NULL,
+  actor_user_id BIGINT UNSIGNED NOT NULL,
+  action VARCHAR(80) NOT NULL,
+  method VARCHAR(10) NULL,
+  path VARCHAR(255) NULL,
+  entity_type VARCHAR(60) NULL,
+  entity_id VARCHAR(64) NULL,
+  request_id VARCHAR(64) NULL,
+  ip VARCHAR(64) NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_sal_session (session_id, created_at),
+  KEY idx_sal_tenant (tenant_id, created_at)
+);
+
+-- ---------- Platform audit ----------
+-- Append-only. Unlike `audit_logs` (which is tenant-scoped and shared with the
+-- HRMS) this table exists to answer "what did ARTHVEX do to a customer", and it
+-- keeps the reason field the product requires.
+CREATE TABLE IF NOT EXISTS platform_audit_logs (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  tenant_id BIGINT UNSIGNED NULL,                  -- NULL = platform-wide action
+  actor_user_id BIGINT UNSIGNED NULL,
+  actor_name VARCHAR(120) NULL,
+  actor_email VARCHAR(190) NULL,
+  actor_role VARCHAR(60) NULL,
+  action VARCHAR(100) NOT NULL,
+  category VARCHAR(40) NULL,                       -- tenant, subscription, plan, entitlement, support, security, data
+  entity_type VARCHAR(60) NULL,
+  entity_id VARCHAR(64) NULL,
+  before_json JSON NULL,
+  after_json JSON NULL,
+  reason VARCHAR(500) NULL,
+  outcome ENUM('success','failure','denied') DEFAULT 'success',
+  ip VARCHAR(64) NULL,
+  user_agent VARCHAR(255) NULL,
+  request_id VARCHAR(64) NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_pal_tenant_time (tenant_id, created_at),
+  KEY idx_pal_action (action, created_at),
+  KEY idx_pal_actor (actor_user_id, created_at)
+);
+
+-- ---------- Tenant domains ----------
+-- Custom domains and verified sub-domains. Kept separate from `tenants.slug`,
+-- which is the immutable provisioning key.
+CREATE TABLE IF NOT EXISTS tenant_domains (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  tenant_id BIGINT UNSIGNED NOT NULL,
+  hostname VARCHAR(190) NOT NULL,
+  is_primary TINYINT(1) DEFAULT 0,
+  verified TINYINT(1) DEFAULT 0,
+  verification_token VARCHAR(80) NULL,
+  ssl_status ENUM('none','pending','active','failed') DEFAULT 'none',
+  status ENUM('active','removed') DEFAULT 'active',
+  created_by BIGINT UNSIGNED NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_tenant_domain (hostname)
+);
+
+-- ---------- Tenant lifecycle history ----------
+CREATE TABLE IF NOT EXISTS tenant_status_history (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  tenant_id BIGINT UNSIGNED NOT NULL,
+  from_status VARCHAR(30) NULL,
+  to_status VARCHAR(30) NOT NULL,
+  reason VARCHAR(500) NULL,
+  actor_user_id BIGINT UNSIGNED NULL,
+  actor_name VARCHAR(120) NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_tsh_tenant (tenant_id, created_at)
+);
+
+-- ---------- Data export / deletion ----------
+-- Exports and deletions are tracked jobs with an expiry, never a synchronous
+-- endpoint that can be used to exfiltrate a tenant in one request.
+CREATE TABLE IF NOT EXISTS data_export_requests (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  tenant_id BIGINT UNSIGNED NOT NULL,
+  requested_by BIGINT UNSIGNED NOT NULL,
+  requested_by_name VARCHAR(120) NULL,
+  scope_json JSON NULL,                            -- { employees: true, payroll: true, ... }
+  format ENUM('json','csv','zip') DEFAULT 'json',
+  reason VARCHAR(500) NOT NULL,
+  status ENUM('queued','running','completed','failed','expired','cancelled') DEFAULT 'queued',
+  storage_path VARCHAR(255) NULL,
+  byte_size BIGINT DEFAULT 0,
+  error_message VARCHAR(500) NULL,
+  completed_at DATETIME NULL,
+  expires_at DATETIME NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_der_tenant (tenant_id, status)
+);
+
+CREATE TABLE IF NOT EXISTS tenant_deletion_requests (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  tenant_id BIGINT UNSIGNED NOT NULL,
+  requested_by BIGINT UNSIGNED NOT NULL,
+  requested_by_name VARCHAR(120) NULL,
+  reason VARCHAR(500) NOT NULL,
+  status ENUM('requested','exported','scheduled','completed','cancelled') DEFAULT 'requested',
+  grace_ends_at DATETIME NOT NULL,
+  purge_after DATETIME NOT NULL,
+  cancelled_at DATETIME NULL,
+  cancelled_by BIGINT UNSIGNED NULL,
+  completed_at DATETIME NULL,
+  reauthenticated_at DATETIME NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_tdr_tenant (tenant_id, status)
+);
+
+
+-- ============================================================
+-- COMMERCIAL LAYER
+-- Add-ons, provider payment events (idempotency), ARTHVEX support tickets,
+-- incidents, maintenance windows, platform notifications and retention config.
+-- All of it is platform-owned; none of it is tenant HR data.
+-- ============================================================
+
+-- A purchasable extra on top of a plan. `grants` is data: [{ "key": "employees.max", "increment": 100 },
+-- { "key": "travel.enabled", "value": 1 }]. The entitlement resolver is the only reader.
+CREATE TABLE IF NOT EXISTS addons (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  addon_key VARCHAR(60) NOT NULL,
+  name VARCHAR(120) NOT NULL,
+  description VARCHAR(255) NULL,
+  grants JSON NOT NULL,
+  price_monthly DECIMAL(12,2) NOT NULL DEFAULT 0,
+  price_model ENUM('flat','per_unit') NOT NULL DEFAULT 'flat',
+  active TINYINT(1) NOT NULL DEFAULT 1,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_addon_key (addon_key)
+);
+
+CREATE TABLE IF NOT EXISTS tenant_addons (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  tenant_id BIGINT UNSIGNED NOT NULL,
+  addon_id BIGINT UNSIGNED NOT NULL,
+  quantity INT UNSIGNED NOT NULL DEFAULT 1,
+  status ENUM('active','cancelled') NOT NULL DEFAULT 'active',
+  starts_at DATETIME NULL,
+  ends_at DATETIME NULL,
+  reason VARCHAR(500) NULL,
+  created_by BIGINT UNSIGNED NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  -- One generated key per live add-on, so the same add-on cannot be attached twice.
+  live_key BIGINT UNSIGNED AS (IF(status = 'active', addon_id, NULL)) PERSISTENT,
+  UNIQUE KEY uq_tenant_live_addon (tenant_id, live_key),
+  KEY idx_tenant_addons (tenant_id, status)
+);
+
+-- Every inbound payment-provider event, keyed by the provider's own event id. The UNIQUE key is
+-- what makes webhook delivery idempotent: a replay hits the constraint and applies nothing.
+CREATE TABLE IF NOT EXISTS payment_provider_events (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  provider VARCHAR(40) NOT NULL,
+  event_id VARCHAR(120) NOT NULL,
+  event_type VARCHAR(60) NOT NULL,
+  tenant_id BIGINT UNSIGNED NULL,
+  invoice_id BIGINT UNSIGNED NULL,
+  payload_hash CHAR(64) NOT NULL,
+  status ENUM('received','processed','ignored','failed') NOT NULL DEFAULT 'received',
+  error VARCHAR(500) NULL,
+  attempts INT UNSIGNED NOT NULL DEFAULT 1,
+  request_id VARCHAR(64) NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  processed_at DATETIME NULL,
+  UNIQUE KEY uq_provider_event (provider, event_id),
+  KEY idx_ppe_tenant (tenant_id, created_at)
+);
+
+-- ARTHVEX's own customer support (not the tenant's employee Helpdesk).
+CREATE TABLE IF NOT EXISTS support_tickets (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  ticket_no VARCHAR(20) NOT NULL,
+  tenant_id BIGINT UNSIGNED NOT NULL,
+  subject VARCHAR(200) NOT NULL,
+  body TEXT NULL,
+  category ENUM('billing','technical','payroll','data','access','other') NOT NULL DEFAULT 'other',
+  priority ENUM('low','normal','high','urgent') NOT NULL DEFAULT 'normal',
+  status ENUM('open','in_progress','waiting_customer','resolved','closed') NOT NULL DEFAULT 'open',
+  assignee_id BIGINT UNSIGNED NULL,
+  requester_user_id BIGINT UNSIGNED NULL,
+  requester_name VARCHAR(120) NULL,
+  sla_due_at DATETIME NULL,
+  first_response_at DATETIME NULL,
+  resolved_at DATETIME NULL,
+  resolution VARCHAR(1000) NULL,
+  support_access_requested TINYINT(1) NOT NULL DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_ticket_no (ticket_no),
+  KEY idx_st_tenant (tenant_id, status),
+  KEY idx_st_status (status, priority)
+);
+
+CREATE TABLE IF NOT EXISTS support_ticket_notes (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  ticket_id BIGINT UNSIGNED NOT NULL,
+  author_user_id BIGINT UNSIGNED NULL,
+  author_name VARCHAR(120) NULL,
+  visibility ENUM('internal','customer') NOT NULL DEFAULT 'internal',
+  body TEXT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_stn_ticket (ticket_id, created_at)
+);
+
+-- Support-level SLA targets, in minutes. Data, so nothing is promised that is not configured.
+CREATE TABLE IF NOT EXISTS support_sla_policies (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  support_level VARCHAR(30) NOT NULL,
+  priority ENUM('low','normal','high','urgent') NOT NULL,
+  first_response_minutes INT UNSIGNED NOT NULL,
+  resolution_minutes INT UNSIGNED NOT NULL,
+  UNIQUE KEY uq_sla (support_level, priority)
+);
+
+CREATE TABLE IF NOT EXISTS platform_incidents (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  title VARCHAR(200) NOT NULL,
+  severity ENUM('sev1','sev2','sev3','sev4') NOT NULL DEFAULT 'sev3',
+  status ENUM('investigating','identified','monitoring','resolved') NOT NULL DEFAULT 'investigating',
+  affected_systems JSON NULL,
+  affected_tenant_ids JSON NULL,
+  root_cause VARCHAR(2000) NULL,
+  resolution VARCHAR(2000) NULL,
+  created_by BIGINT UNSIGNED NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  resolved_at DATETIME NULL,
+  KEY idx_inc_status (status, created_at)
+);
+
+CREATE TABLE IF NOT EXISTS platform_incident_updates (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  incident_id BIGINT UNSIGNED NOT NULL,
+  status VARCHAR(30) NULL,
+  message VARCHAR(2000) NOT NULL,
+  author_user_id BIGINT UNSIGNED NULL,
+  author_name VARCHAR(120) NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_inc_upd (incident_id, created_at)
+);
+
+-- tenant_id NULL = the whole platform. Only platform operators can write this table.
+CREATE TABLE IF NOT EXISTS maintenance_windows (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  tenant_id BIGINT UNSIGNED NULL,
+  message VARCHAR(500) NOT NULL,
+  starts_at DATETIME NOT NULL,
+  ends_at DATETIME NOT NULL,
+  status ENUM('scheduled','cancelled') NOT NULL DEFAULT 'scheduled',
+  created_by BIGINT UNSIGNED NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_mw_window (status, starts_at, ends_at)
+);
+
+-- In-app notifications to ARTHVEX operators (trial ending, payment failed, limit near, ...).
+-- dedupe_key stops the same condition notifying twice inside its window.
+CREATE TABLE IF NOT EXISTS platform_notifications (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  event_key VARCHAR(60) NOT NULL,
+  severity ENUM('info','warning','critical') NOT NULL DEFAULT 'info',
+  tenant_id BIGINT UNSIGNED NULL,
+  title VARCHAR(200) NOT NULL,
+  body VARCHAR(1000) NULL,
+  dedupe_key VARCHAR(160) NULL,
+  read_at DATETIME NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_pn_dedupe (dedupe_key),
+  KEY idx_pn_unread (read_at, created_at)
+);
+
+-- Data-retention policy: an intent, never an automatic delete. Execution is a deliberate, audited act.
+CREATE TABLE IF NOT EXISTS retention_policies (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  data_class VARCHAR(40) NOT NULL,
+  retain_days INT UNSIGNED NOT NULL,
+  updated_by BIGINT UNSIGNED NULL,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_retention (data_class)
+);
+
+-- Billing contacts, separate from the people who log in.
+CREATE TABLE IF NOT EXISTS tenant_contacts (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  tenant_id BIGINT UNSIGNED NOT NULL,
+  contact_type ENUM('billing','finance','legal','technical') NOT NULL,
+  name VARCHAR(120) NULL,
+  email VARCHAR(190) NOT NULL,
+  phone VARCHAR(30) NULL,
+  gstin VARCHAR(20) NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_tenant_contact (tenant_id, contact_type, email)
 );
 
 -- ============================================================

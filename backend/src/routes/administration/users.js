@@ -16,8 +16,16 @@ const { asyncH, HttpError } = require('../../utils/helpers');
 const { requirePermission, invalidateRoleCache } = require('../../middleware/auth');
 const { tenantId, writeTenantId, audit, int, bool, paging, decode, insertRows } = require('./_shared');
 const rbac = require('../../services/rbac');
+const limits = require('../../services/limits');
+const usage = require('../../services/usage');
 
 const r = express.Router();
+
+/**
+ * Roles that count against the sold `admins.max` seat rather than a plain login
+ * seat. Kept as data so adding a role cannot silently escape the cap.
+ */
+const ADMIN_ROLES = new Set(['company_owner', 'hr_admin', 'payroll_admin', 'finance_admin']);
 
 const USERS_READ = requirePermission('administration.users.view', { anyOf: ['user.manage'] });
 const USERS_WRITE = requirePermission('administration.users.manage', { anyOf: ['user.manage'] });
@@ -114,7 +122,7 @@ r.get('/users/:id', USERS_READ, asyncH(async (req, res) => {
 }));
 
 // ---------------------------------------------------------------- create
-r.post('/users', USERS_WRITE, asyncH(async (req, res) => {
+async function createUser(req, res) {
   const t = writeTenantId(req);
   const { name, email, role, employee_id, sendInvite = true } = req.body || {};
   if (!name || !email || !role) throw new HttpError(400, 'name, email and role are required');
@@ -125,6 +133,13 @@ r.post('/users', USERS_WRITE, asyncH(async (req, res) => {
   if (exists[0]) {
     if (String(exists[0].tenant_id) === String(t)) throw new HttpError(409, 'That email already has a login in this company');
     throw new HttpError(409, 'That email is already in use');
+  }
+
+  // Seats and admin seats are sold separately from employees (spec §25), so they
+  // are checked here rather than being assumed to follow the employee count.
+  await limits.assertWithinLimit({ tenantId: t, entitlementKey: 'active_users.max', incoming: 1, action: 'user.create', req });
+  if (ADMIN_ROLES.has(String(role))) {
+    await limits.assertWithinLimit({ tenantId: t, entitlementKey: 'admins.max', incoming: 1, action: 'user.create', req });
   }
   if (employee_id) {
     const [emp] = await pool.query('SELECT id FROM employees WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL', [int(employee_id), t]);
@@ -166,11 +181,15 @@ r.post('/users', USERS_WRITE, asyncH(async (req, res) => {
   }
 
   await audit(req, { action: 'user.create', entityType: 'user', entityId: ins.insertId, after: { email: mail, role, status } });
+  await usage.recompute(t, { source: 'user_create', actorUserId: req.user.id, requestId: req.requestId });
   res.status(201).json({
     data: { id: ins.insertId, email: mail, status },
     ...(invitation ? { invitation } : { tempPassword }),
   });
-}));
+}
+// Seat caps are check-then-insert; serialise per company (see limits.withTenantLock).
+r.post('/users', USERS_WRITE, asyncH((req, res) =>
+  limits.withTenantLock(writeTenantId(req), 'user.create', () => createUser(req, res))));
 
 // ---------------------------------------------------------------- update
 r.put('/users/:id', USERS_WRITE, asyncH(async (req, res) => {

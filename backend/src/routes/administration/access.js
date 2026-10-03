@@ -87,7 +87,7 @@ r.get('/roles/:id', ROLES_READ, asyncH(async (req, res) => {
   const groups = await rbac.groupsForRole(role.id);
   const [[{ users }]] = await pool.query('SELECT COUNT(*) AS users FROM user_roles WHERE role_id = ?', [role.id]);
   // Anything this role grants beyond the caller's own reach.
-  const beyond = req.user.isPlatformAdmin ? [] : rbac.privilegeExcess(req.user.permissions || [], role.perms);
+  const beyond = req.user.isPlatformSuperAdmin ? [] : rbac.privilegeExcess(req.user.permissions || [], role.perms);
   res.json({
     data: {
       ...rbac.roleSummary(role),
@@ -95,7 +95,7 @@ r.get('/roles/:id', ROLES_READ, asyncH(async (req, res) => {
       permissions: [...role.perms].sort(),
       groups,
       userCount: Number(users),
-      editable: rbac.canManageRoleObject(req.user) && beyond.length === 0 && (role.tenant_id != null || req.user.isPlatformAdmin),
+      editable: rbac.canManageRoleObject(req.user) && beyond.length === 0 && (role.tenant_id != null || req.user.isPlatformSuperAdmin),
       beyondYourAccess: beyond,
     },
   });
@@ -111,7 +111,7 @@ r.post('/roles', ROLES_WRITE, asyncH(async (req, res) => {
 
   // The new role may never exceed the creator's own reach.
   const excess = rbac.privilegeExcess(req.user.permissions || [], permissions);
-  if (excess.length && !req.user.isPlatformAdmin) {
+  if (excess.length && !req.user.isPlatformSuperAdmin) {
     throw new HttpError(403, `These permissions exceed your own access: ${excess.slice(0, 5).map((e) => e.base).join(', ')}`);
   }
 
@@ -156,7 +156,7 @@ r.put('/roles/:id', ROLES_WRITE, asyncH(async (req, res) => {
   if (Array.isArray(permissions)) {
     // The edited role must still not exceed the editor's reach.
     const excess = rbac.privilegeExcess(req.user.permissions || [], permissions);
-    if (excess.length && !req.user.isPlatformAdmin) {
+    if (excess.length && !req.user.isPlatformSuperAdmin) {
       throw new HttpError(403, `These permissions exceed your own access: ${excess.slice(0, 5).map((e) => e.base).join(', ')}`);
     }
     await rbac.writeRolePermissions(t, role.id, permissions, req.user.id);
@@ -223,11 +223,11 @@ r.put('/permission-groups/:id/permissions', ROLES_WRITE, asyncH(async (req, res)
     'SELECT * FROM permission_groups WHERE id = ? AND (tenant_id = ? OR tenant_id IS NULL)', [int(req.params.id), t]
   );
   if (!rows[0]) throw new HttpError(404, 'Permission group not found');
-  if (rows[0].tenant_id === null && !req.user.isPlatformAdmin) {
+  if (rows[0].tenant_id === null && !req.user.isPlatformSuperAdmin) {
     throw new HttpError(403, 'Platform permission groups cannot be edited by a company administrator');
   }
   const excess = rbac.privilegeExcess(req.user.permissions || [], permissions);
-  if (excess.length && !req.user.isPlatformAdmin) {
+  if (excess.length && !req.user.isPlatformSuperAdmin) {
     throw new HttpError(403, `These permissions exceed your own access: ${excess.slice(0, 5).map((e) => e.base).join(', ')}`);
   }
   const [known] = await pool.query('SELECT id, pkey FROM permissions WHERE pkey IN (?)', [[...new Set(permissions)]]);
@@ -301,10 +301,10 @@ r.get('/access/tenant-check/:userId', requirePermission('platform.tenants.view',
       userId: target,
       found: !!rows[0],
       sameTenant,
-      canRead: sameTenant || req.user.isPlatformAdmin,
+      canRead: sameTenant || req.user.isPlatformSuperAdmin,
       note: sameTenant
         ? 'The user belongs to your company — their details are readable.'
-        : req.user.isPlatformAdmin
+        : req.user.isPlatformSuperAdmin
           ? 'The user belongs to another company; platform administrators may inspect it.'
           : 'The user belongs to another company — treated as not found.',
     },

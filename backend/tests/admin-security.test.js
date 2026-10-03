@@ -29,6 +29,8 @@ let tenantId;
 let platformUserId;
 /** role name -> user id, and user id -> access token */
 const users = {};
+/** Tenants created during a run that the cleanup has to remove as well. */
+const extraTenantIds = [];
 
 const api = async (method, path, { token, body, headers = {} } = {}) => {
   const res = await fetch(`${baseUrl}${path}`, {
@@ -122,11 +124,13 @@ after(async () => {
     `SELECT table_name FROM information_schema.columns
      WHERE table_schema = ? AND column_name = 'tenant_id'`, [env.db.database]
   );
+  const cleanupIds = [tenantId, users.other?.tenantId, ...extraTenantIds].filter(Boolean);
   for (const { table_name: table } of tables) {
-    await pool.query(`DELETE FROM \`${table}\` WHERE tenant_id IN (?, ?)`, [tenantId, users.other?.tenantId]);
+    await pool.query(`DELETE FROM \`${table}\` WHERE tenant_id IN (?)`, [cleanupIds]).catch(() => {});
   }
   await pool.query('DELETE FROM users WHERE id = ?', [platformUserId]).catch(() => {});
-  await pool.query('DELETE FROM tenants WHERE slug IN (?, ?)', [slug, `${slug}-other`]).catch(() => {});
+  // Platform audit rows for a platform-wide action have no tenant; clear ours by reason.
+  await pool.query('DELETE FROM tenants WHERE slug IN (?, ?) OR id IN (?)', [slug, `${slug}-other`, extraTenantIds]).catch(() => {});
   const rbac = require('../src/services/rbac');
   rbac.invalidateAll();
   await pool.end();
@@ -488,6 +492,9 @@ describe('tenant provisioning', () => {
     assert.ok(meta.body.data.sections.find((s) => s.key === 'modules').accessible,
       'a fresh company owner must be able to administer modules');
     users.provisioned = { tenantId: newTenantId };
+    // Tracked so after() can remove it — otherwise every run leaves another
+    // "Provisioned Co" behind in the demo database.
+    extraTenantIds.push(newTenantId);
   });
 
   test('the tenant slug is validated and unique', async () => {

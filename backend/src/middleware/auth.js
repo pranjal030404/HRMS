@@ -1,7 +1,7 @@
 const crypto = require('crypto');
 const { pool } = require('../config/db');
 const { verifyAccessToken } = require('../utils/jwt');
-const { hasPerm, allowedScopes, ROLE_DEFS } = require('../utils/permissions');
+const { hasPerm, allowedScopes, ROLE_DEFS, PLATFORM_ROLE_KEYS } = require('../utils/permissions');
 const { HttpError } = require('../utils/helpers');
 const rbac = require('../services/rbac');
 
@@ -32,11 +32,43 @@ function invalidateRoleCache() { rolePermCache.clear(); rbac.invalidateAll(); }
  * Derive the tenant from the authenticated session — never from the request body
  * or a query parameter. A non-platform user may only ever address their own
  * company, whatever they send.
+ *
+ * Deliberately synchronous: it is called from a lot of places, and the
+ * support-access check belongs on the paths that can actually *address another
+ * company* — see `resolveTenantFor`, which the platform and administration
+ * routers use in place of this.
  */
 function tenantOf(req) {
   if (!req.user || req.user.role === 'platform_super_admin') return req.user?.tenant_id ?? null;
   if (req.user.tenant_id == null) throw new HttpError(403, 'Your account is not bound to a company');
   return req.user.tenant_id;
+}
+
+/**
+ * The tenant a request may address, with the full evaluation chain applied
+ * (spec §23). Use this wherever a caller can name a company other than its own.
+ *
+ * A platform operator reaching into a company it is not bound to must hold a
+ * live support-access session. That check is the entire point of Support Access:
+ * it is what stops "platform administrator" from being a synonym for "may read
+ * every customer's payroll".
+ */
+async function resolveTenantFor(req) {
+  const asked = req.query?.tenant_id ?? req.body?.tenant_id;
+  const user = req.user;
+  if (!user) throw new HttpError(401, 'Authentication required');
+  if (user.tenant_id != null && (asked === undefined || asked === null || asked === '')) return user.tenant_id;
+  if (user.isPlatformAdmin) {
+    if (asked === undefined || asked === null || asked === '') return user.tenant_id ?? null;
+    const supportAccess = require('../services/supportAccess');
+    await supportAccess.assertTenantReach(user, Number(asked));
+    return Number(asked);
+  }
+  if (user.tenant_id == null) throw new HttpError(403, 'Your account is not bound to a company');
+  if (asked !== undefined && asked !== null && asked !== '' && Number(asked) !== Number(user.tenant_id)) {
+    throw new HttpError(403, 'You cannot address another company');
+  }
+  return user.tenant_id;
 }
 
 /** Require a valid access token. Attaches req.user with *effective* permissions. */
@@ -62,7 +94,12 @@ async function authenticate(req, res, next) {
     // refused at authentication time — a disabled user cannot hold a session.
     if (user.status !== 'active') throw new HttpError(401, `Account is ${user.status.replace(/_/g, ' ')}`);
     if (user.locked_until && new Date(user.locked_until) > new Date()) throw new HttpError(423, 'Account is temporarily locked');
-    if (user.tenant_id && user.tenant_status !== 'active') throw new HttpError(403, 'Company account suspended');
+    // The tenant lifecycle (spec §27) is the second gate in the evaluation chain:
+    // a deleted company cannot hold a session at all. Every *other* non-active
+    // state (suspended, past due, grace, archived) still authenticates — those are
+    // handled as read-only by `requireTenantWritable` on the write paths, so a
+    // company locked out of billing does not lose sight of its own payroll.
+    if (user.tenant_id && user.tenant_status === 'deleted') throw new HttpError(403, 'This company account has been deleted');
 
     const effective = await rbac.effectivePermissions(user);
     user.permissions = effective.permissions;
@@ -70,9 +107,47 @@ async function authenticate(req, res, next) {
     user.scopes = effective.scopes;
     user.directPermissions = effective.directPermissions;
     user.deniedPermissions = effective.deniedPermissions;
+    // Custom platform roles are `platform_custom_*` rows in `roles` and only ever
+    // belong to company-less accounts, so a tenant user can never reach this branch.
+    user.isPlatformAdmin = PLATFORM_ROLE_KEYS.includes(user.role)
+      || (user.tenant_id == null && /^platform_custom_[a-z0-9_]+$/.test(String(user.role)));
+    user.isPlatformSuperAdmin = user.role === 'platform_super_admin';
+    // A platform role with no company bound is a pure control-plane operator: it
+    // has no tenant HRMS modules, because reaching a customer's records is what
+    // Support Access is for.
     user.accessibleModules = effective.accessibleModules;
-    user.isPlatformAdmin = user.role === 'platform_super_admin';
+
+    // Resolve entitlements once per request so the module gate, the limit gate and
+    // the "why is this unavailable" panel all read the same snapshot.
+    if (user.tenant_id) {
+      try {
+        const entitlementService = require('../services/entitlements');
+        const snapshot = await entitlementService.resolveTenant(user.tenant_id);
+        user.tenantStatus = snapshot.tenant.status;
+        user.tenantReadOnly = snapshot.readOnly;
+        user.tenantBlocked = snapshot.blocked;
+        user.subscription = snapshot.subscription;
+        user.plan = snapshot.plan;
+        user.entitlements = snapshot.entitlements;
+      } catch (e) {
+        // A control-plane failure must not stop an employee reaching their own
+        // payslips; the write gates re-resolve and will report the real problem.
+        console.error('[auth] entitlement resolution failed:', e.message);
+      }
+    }
+
+    // A live support session travels with the request so the banner can render and
+    // every cross-tenant read can be attributed to it.
+    if (user.isPlatformAdmin) {
+      try {
+        user.supportSession = await require('../services/supportAccess').currentSession(user.id);
+      } catch (_) { user.supportSession = null; }
+    }
+
     req.user = user;
+    if (user.tenant_id) {
+      pool.query('UPDATE tenants SET last_activity_at = NOW() WHERE id = ?', [user.tenant_id]).catch(() => {});
+    }
     next();
   } catch (err) {
     if (err.name === 'TokenExpiredError') return next(new HttpError(401, 'Session expired'));
@@ -91,6 +166,9 @@ function requirePermission(perm, opts = {}) {
   return (req, res, next) => {
     const user = req.user;
     if (!user) return next(new HttpError(401, 'Authentication required'));
+    // Only the Platform Super Admin bypasses. The narrower platform roles
+    // (billing, support, security, auditor) hold real, enumerated grants, so the
+    // same predicate that decides a tenant's access decides theirs.
     if (user.role === 'platform_super_admin') return next();
     const perms = user.permissions || [];
     const allowed = opts.anyOf
@@ -121,8 +199,14 @@ function requirePermission(perm, opts = {}) {
  *
  *   app.use('/api/payroll', requireModuleEnabled('payroll'), payrollRouter);
  *
- * The platform super admin is exempt (they operate the platform itself), and the
- * error names the module so the client can say "disabled", not just "forbidden".
+ * The gate is the conjunction of two independent decisions (spec §23):
+ *   • entitlement — does the tenant's plan grant `<module>.enabled`?
+ *   • configuration — has the company switched it on?
+ * A module the tenant paid for but did not switch on is refused with the same
+ * message as one the plan does not include; `err.reason` tells them which, so the
+ * UI can render the right diagnostic instead of a bare "forbidden".
+ *
+ * The platform super admin is exempt (they operate the platform itself).
  */
 function requireModuleEnabled(moduleKey) {
   return (req, res, next) => {
@@ -133,14 +217,88 @@ function requireModuleEnabled(moduleKey) {
     if (!user) return authenticate(req, res, (err) => (err ? next(err) : requireModuleEnabled(moduleKey)(req, res, next)));
     if (user.role === 'platform_super_admin') return next();
     if (user.tenant_id == null) return next(new HttpError(403, 'Your account is not bound to a company'));
-    rbac.isModuleEnabled(user.tenant_id, moduleKey)
-      .then((on) => {
-        if (on) return next();
-        const err = new HttpError(403, `The ${moduleKey} module is disabled for this company`);
+    Promise.all([
+      rbac.isModuleEnabled(user.tenant_id, moduleKey),
+      require('../services/entitlements').moduleAvailability(user.tenant_id, moduleKey).catch(() => null),
+    ])
+      .then(([on, availability]) => {
+        if (on && (!availability || availability.enabled)) return next();
+        const err = new HttpError(403,
+          availability && availability.missingDependencies && availability.missingDependencies.length
+            ? `The ${moduleKey} module requires ${availability.missingDependencies.map((m) => m.name).join(', ')}`
+            : `The ${moduleKey} module is disabled for this company`);
         err.module = moduleKey;
+        err.entitlement = availability ? availability.entitlement : null;
+        err.reason = availability ? availability.reason : null;
         return next(err);
       })
       .catch(next);
+  };
+}
+
+/**
+ * Gate a write on the tenant's lifecycle and subscription state (spec §26, §27).
+ *
+ * Reads are deliberately not gated: a company suspended for non-payment keeps
+ * full sight of its own payroll history — that is both the humane reading and the
+ * one that makes a customer pay.
+ */
+function requireTenantWritable() {
+  return (req, res, next) => {
+    const user = req.user;
+    if (!user) return next(new HttpError(401, 'Authentication required'));
+    if (user.role === 'platform_super_admin') return next();
+    if (user.tenant_id == null) return next(new HttpError(403, 'Your account is not bound to a company'));
+    if (user.tenantBlocked) return next(new HttpError(403, 'This company has been deleted'));
+    if (user.tenantReadOnly) {
+      const status = user.subscription?.status || user.tenantStatus;
+      return next(new HttpError(402,
+        `Your company is ${String(status).replace(/_/g, ' ')} — existing records remain readable but nothing new can be created until billing is resolved.`,
+        { tenantStatus: user.tenantStatus, subscriptionStatus: user.subscription?.status || null }));
+    }
+    next();
+  };
+}
+
+/**
+ * Gate a route on an entitlement (`payroll.statutory.enabled`) or a numeric limit.
+ * `usageKey` turns the same middleware into the limit check the server must own.
+ */
+function requireEntitlement(entitlementKey) {
+  return (req, res, next) => {
+    const user = req.user;
+    if (!user) return next(new HttpError(401, 'Authentication required'));
+    if (user.role === 'platform_super_admin') return next();
+    if (user.tenant_id == null) return next(new HttpError(403, 'Your account is not bound to a company'));
+    const entry = user.entitlements && user.entitlements[entitlementKey];
+    if (entry) {
+      if (entry.kind === 'boolean' ? !entry.enabled : entry.value <= 0) {
+        const err = new HttpError(402, `${entry.name} is not included in your plan`, { entitlementKey });
+        err.entitlement = entitlementKey;
+        return next(err);
+      }
+      return next();
+    }
+    require('../services/entitlements').isEnabled(user.tenant_id, entitlementKey)
+      .then((on) => (on ? next() : next(new HttpError(402, 'That capability is not included in your plan', { entitlementKey }))))
+      .catch(next);
+  };
+}
+
+/**
+ * Require a platform role. Unlike `requirePermission` this is the *layer*, not a
+ * capability: a company owner holding a stray `platform.*` direct permission still
+ * cannot open the control plane.
+ */
+function requirePlatformRole() {
+  return (req, res, next) => {
+    if (!req.user) return next(new HttpError(401, 'Authentication required'));
+    if (!req.user.isPlatformAdmin) {
+      return next(new HttpError(403, 'The ARTHVEX platform console is restricted to platform administrators'));
+    }
+    // Platform-only security policy (IP allowlist, mandatory MFA, session age) —
+    // separate from, and unaffected by, any company's own security settings.
+    require('../services/platformSecurity').assertAllowed(req.user, req).then(() => next(), next);
   };
 }
 
@@ -304,7 +462,8 @@ function tenantRow(rows, tenantId, label = 'Record') {
 }
 
 module.exports = {
-  authenticate, requirePermission, requireAnyPermission, requireModuleEnabled, scopeFor, employeeScopeCondition,
-  departmentRowCondition, headedDepartmentIds, canActOnEmployee, tenantOf, tenantRow,
+  authenticate, requirePermission, requireAnyPermission, requireModuleEnabled, requireEntitlement,
+  requirePlatformRole, requireTenantWritable, scopeFor, employeeScopeCondition,
+  departmentRowCondition, headedDepartmentIds, canActOnEmployee, tenantOf, resolveTenantFor, tenantRow,
   departmentSubtree, invalidateRoleCache, loadRolePermissions, requestContext,
 };

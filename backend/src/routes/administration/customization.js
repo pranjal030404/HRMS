@@ -344,7 +344,7 @@ const visibilityMode = (v) => (typeof v === 'string' ? v : (unj(v, {}) || {}).mo
 /** Role/department visibility, enforced server side on read and write. */
 async function assertFieldVisible(req, def) {
   if (!def) return;
-  if (req.user.isPlatformAdmin) return;
+  if (req.user.isPlatformSuperAdmin) return;
   const canManage = (req.user.permissions || []).includes('administration.custom_fields.manage');
   if (visibilityMode(def.visibility) === 'hidden' && !canManage) {
     throw new HttpError(403, 'That field is not available');

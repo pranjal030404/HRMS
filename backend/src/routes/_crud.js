@@ -3,6 +3,8 @@ const { pool } = require('../config/db');
 const { asyncH, HttpError, pick } = require('../utils/helpers');
 const { logAudit } = require('../services/audit');
 const { requirePermission } = require('../middleware/auth');
+const limits = require('../services/limits');
+const usage = require('../services/usage');
 
 /**
  * Generic tenant-scoped CRUD for master tables.
@@ -11,6 +13,9 @@ const { requirePermission } = require('../middleware/auth');
  *   orderBy: 'name', numericFields: [string...], boolFields: [string...], jsonFields: [string...],
  *   readPerm: [string...] (defaults to perm with '.manage' → '.view' when applicable)
  *   listWhere: (tenantId, req) => [sql, params] (extra WHERE)
+ *   limit: 'employees.max' — entitlement that caps how many rows of this table the
+ *     tenant may hold (spec §14). Declared as data so a new metered resource gets
+ *     enforcement by adding one line, not by remembering to add a check.
  * }
  * Reads require the read permission; create/update/delete require cfg.perm.
  */
@@ -58,10 +63,18 @@ function crudRouter(cfg) {
     res.json({ data: rows[0] });
   }));
 
-  r.post('/', gateWrite, asyncH(async (req, res) => {
+  const createRow = async (req, res) => {
     const data = coerce(req.body);
     for (const f of cfg.required || []) {
       if (data[f] === undefined || data[f] === null) throw new HttpError(400, `${f} is required`);
+    }
+    // Server-side commercial limit (spec §14). The value comes from the tenant's
+    // plan or override — nothing about it is hard-coded here.
+    if (cfg.limit) {
+      await limits.assertWithinLimit({
+        tenantId: req.user.tenant_id, entitlementKey: cfg.limit, incoming: 1,
+        action: `${cfg.table}.create`, req,
+      });
     }
     const cols = ['tenant_id', ...cfg.fields];
     const vals = [req.user.tenant_id, ...cfg.fields.map((f) => data[f] ?? null)];
@@ -70,8 +83,13 @@ function crudRouter(cfg) {
       vals
     );
     await logAudit({ tenantId: req.user.tenant_id, actor: req.user, action: `${cfg.table}.create`, entityType: cfg.table, entityId: ins.insertId, after: data, req });
+    if (cfg.limit) await usage.recompute(req.user.tenant_id, { source: `${cfg.table}_create`, actorUserId: req.user.id, requestId: req.requestId });
     res.status(201).json({ data: { id: ins.insertId, ...data } });
-  }));
+  };
+  // Capped tables check-then-insert, so they run under a per-company lock (see limits.withTenantLock).
+  r.post('/', gateWrite, asyncH((req, res) => (cfg.limit
+    ? limits.withTenantLock(req.user.tenant_id, `${cfg.table}.create`, () => createRow(req, res))
+    : createRow(req, res))));
 
   r.put('/:id', gateWrite, asyncH(async (req, res) => {
     const [before] = await pool.query(`SELECT id, ${allCols()} FROM ${cfg.table} WHERE id = ? AND tenant_id = ?`, [req.params.id, req.user.tenant_id]);

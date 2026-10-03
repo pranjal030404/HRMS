@@ -48,4 +48,27 @@ function relPath(file) {
   return path.relative(env.uploadDir, file.path).replace(/\\/g, '/');
 }
 
-module.exports = { upload, relPath };
+/**
+ * Delete an already-written upload.
+ *
+ * `upload()` puts the file on disk before the route handler runs, which is
+ * unavoidable — the size and mime type are only known once the bytes have arrived.
+ * It means a request refused *after* that point (a cap, a failed insert) would
+ * otherwise leave an orphan on disk that no row references: the tenant's real
+ * storage keeps growing while their usage meter says they are under the limit.
+ * Any handler that can reject must therefore call this on its way out.
+ */
+function discardUpload(file) {
+  if (!file || !file.path) return;
+  try {
+    fs.unlinkSync(file.path);
+  } catch (e) {
+    // Already gone, or never written. Either way there is nothing to clean up, but a
+    // real failure here means a leaked file, so it must not pass silently.
+    if (e.code !== 'ENOENT') {
+      console.error(`[upload] could not discard rejected upload ${file.path}: ${e.message}`);
+    }
+  }
+}
+
+module.exports = { upload, relPath, discardUpload };

@@ -7,7 +7,17 @@ const express = require('express');
 const { pool } = require('../config/db');
 const { asyncH, HttpError } = require('../utils/helpers');
 const { authenticate } = require('../middleware/auth');
-const { hasPerm } = require('../utils/permissions');
+const { allowedScopes } = require('../utils/permissions');
+
+/**
+ * Every answer here is a COMPANY-wide aggregate or list, so it needs company-wide reach.
+ * `hasPerm` was used before, which is true for `leave.view:own` or `employee.view:team`,
+ * letting an ordinary employee ask for everyone on leave today and a manager for the
+ * whole company's headcount. Scoped holders get a refusal that says what they would need.
+ */
+const companyWide = (user, perm) => user.role === 'platform_super_admin'
+  || allowedScopes(user.permissions || [], perm).some((sc) => ['company', 'tenant', 'platform'].includes(sc));
+const hasPerm = (perms, perm) => companyWide({ permissions: perms }, perm);
 
 const r = express.Router();
 r.use(authenticate);
@@ -26,8 +36,20 @@ const SUGGESTIONS = [
 // ---- Chat: intent → scoped SQL ----
 r.post('/ask', asyncH(async (req, res) => {
   const T = req.user.tenant_id;
+  if (T == null) throw new HttpError(403, 'The assistant answers questions about one company; sign in as a company user.');
   const q = String(req.body?.question || '').trim();
   if (!q) throw new HttpError(400, 'question required');
+
+  // Metered entitlement (spec §13, §14). The AI assistant is a per-plan capability,
+  // so both the boolean grant and the monthly question allowance are checked here
+  // rather than at the UI. A tenant that never bought AI gets a 402 that names the
+  // entitlement; a tenant that has exhausted its allowance gets the same with the
+  // reset guidance.
+  const limits = require('../services/limits');
+  await limits.assertWithinLimit({
+    tenantId: T, entitlementKey: 'ai.requests.month', incoming: 1, action: 'ai.ask', req,
+  });
+
   const ql = q.toLowerCase();
 
   const can = (p) => hasPerm(req.user.permissions || [], p);
@@ -137,6 +159,13 @@ r.post('/ask', asyncH(async (req, res) => {
     `INSERT INTO ai_conversations (tenant_id, user_id, question, answer, intent, data_scope, status) VALUES (?,?,?,?,?,?,?)`,
     [T, req.user.id, q, answer || '', intent, req.user.role, status]
   );
+  // Charged per question asked, answered or blocked: a permission-refused answer
+  // still consumed the tenant's allowance, and a meter that only counts successes
+  // would quietly under-report real consumption.
+  await require('../services/usage').increment(T, 'ai.requests.month', 1, {
+    source: 'ai_ask', referenceType: 'ai_conversation', referenceId: ins.insertId,
+    actorUserId: req.user?.id, requestId: req.requestId, metadata: { intent, status },
+  }).catch((e) => console.error('[usage] AI metering failed:', e.message));
   res.json({ data: { id: ins.insertId, intent, answer, link } });
 }));
 

@@ -66,11 +66,27 @@ async function startRun({ tenantId, workflow, entityType, entityId, ctx }) {
   const steps = typeof workflow.steps === 'string' ? JSON.parse(workflow.steps) : workflow.steps;
   if (!Array.isArray(steps) || !steps.length) return null;
 
+  // Metered entitlement (spec §13, §14). A run that will actually execute is
+  // charged; a trigger whose conditions did not match is not. The workflow is
+  // still allowed to be *created* on a tenant that has run out — the cap governs
+  // execution volume, not authoring, so `onExhausted: 'warn'` here would be wrong
+  // and blocking below is the correct behaviour: an exhausted tenant simply stops
+  // starting new approval chains and its existing ones continue to completion.
+  const limits = require('./limits');
+  await limits.assertWithinLimit({
+    tenantId, entitlementKey: 'workflow.executions.month', incoming: 1,
+    action: 'workflow.execute', onExhausted: 'block',
+  });
+
   const [run] = await pool.query(
     `INSERT INTO workflow_runs (tenant_id, workflow_id, entity_type, entity_id, context, status, current_step)
      VALUES (?,?,?,?,?, 'running', ?)`,
     [tenantId, workflow.id, entityType, String(entityId), JSON.stringify(ctx || {}), steps[0].name]
   );
+  await require('./usage').increment(tenantId, 'workflow.executions.month', 1, {
+    source: 'workflow_run', referenceType: 'workflow_run', referenceId: run.insertId,
+    metadata: { workflowId: workflow.id, entityType },
+  }).catch((e) => console.error('[usage] workflow execution metering failed:', e.message));
   await createStepTasks({ tenantId, runId: run.insertId, step: steps[0], ctx });
   return run.insertId;
 }

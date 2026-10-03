@@ -2,6 +2,8 @@
 
 A production-grade, multi-tenant **Human Resource Management System** for Indian SMB / mid-market companies (10–200 employees, architected for more), built from the *Arthvex HRMS Complete Product Specification v2.0* — the full employee lifecycle from workforce planning and recruitment through onboarding, employment, time, leave, payroll, performance, compensation, engagement, service delivery, assets, travel, separation and analytics. Learning management is intentionally excluded (delivered by the standalone Arthvex LMS via the integration contract).
 
+Ships with a **Platform Control Plane** above the tenants: subscription lifecycle, an entitlement system, usage metering, module dependencies, a provisioning wizard and time-limited auditable Support Access. See [`docs/platform-control-plane.md`](docs/platform-control-plane.md).
+
 **Stack: React (Vite) · Node.js + Express · MySQL/MariaDB**
 
 ---
@@ -68,9 +70,13 @@ A second entrance to the same app, for administrators. Password **`Admin@12345`*
 
 | Email | Role | What you can do |
 |---|---|---|
-| `admin@arthvex.com` | Administrator | **Everything** — every permission, every module (including Travel / Workforce / AI / Integrations even when a company has them switched off), plus the cross-tenant Companies console. Bound to Arthvex, so HR pages show real data |
+| `admin@arthvex.com` | Administrator | Platform Super Admin **bound to** Arthvex. 28 `platform.*` permissions — the control plane in full, and the company directory is open cross-tenant |
 
-It is a `platform_super_admin` bound to the demo company on purpose: a platform admin with no company can drive every tenant but sees empty HR pages, because those pages scope data by `req.user.tenant_id`.
+A note on what that account deliberately **cannot** do: `platform_super_admin` holds no tenant HRMS
+permission. It cannot read Arthvex's own payroll, even though it is bound to Arthvex. That is the point —
+"administers the platform" and "reads this customer's data" are separate claims, and the second is granted
+only through Support Access. If you want to work inside a company, sign in as that company's `owner@…`
+account.
 
 #### Employee & manager sign-in — `http://localhost:5173/login`
 
@@ -85,9 +91,23 @@ All demo accounts use password **`Password@123`**:
 | `manager@arthvex.com` | Manager | Team views + approvals (Rahul Nair) |
 | `employee@arthvex.com` | Employee | Self-service portal (Diya Patel) |
 | `auditor@arthvex.com` | Auditor | Read-only + audit log |
-| `super@arthvex.com` | Platform Super Admin | Cross-tenant only, not bound to a company |
+| `super@arthvex.com` | Platform Super Admin | Cross-tenant control plane, not bound to a company — lands in `/platform` |
 
 > `/admin` is a presentation of the same authentication, not a second identity store: it authenticates against `/api/auth/login` and reach is still decided by the account's role on the server. Signing in there with a non-admin account simply lands you in an app that shows only what that role allows.
+
+#### Platform console — `http://localhost:5173/platform`
+
+Sign in at `/admin` or `/login` with any of these and you land in the control plane instead of the HRMS. All use password **`Platform@123`** and have no company bound:
+
+| Email | Role | What you can do |
+|---|---|---|
+| `super@platform.arthvex.com` | Platform Super Admin | Everything, including provisioning companies, lifecycle transitions, data exports and deletion requests |
+| `billing@platform.arthvex.com` | Platform Billing Admin | Plans, subscriptions, usage, audit — no lifecycle or support access |
+| `support@platform.arthvex.com` | Platform Support Admin | Support Access (grant/revoke), company directory, usage, security signals |
+| `security@platform.arthvex.com` | Platform Security Admin | Security posture, support-session visibility, audit export — no money |
+| `auditor@platform.arthvex.com` | Platform Auditor | Read every platform view, write nothing |
+
+No platform role holds a single tenant HRMS permission. The only way into a customer's data is Support Access: a reasoned, time-boxed session whose every request — reads included — is written to the customer's audit trail.
 
 ---
 
@@ -95,6 +115,7 @@ All demo accounts use password **`Password@123`**:
 
 | Area | Highlights |
 |---|---|
+| **Platform control plane** | `/platform` — cross-tenant dashboard (MRR, lifecycle counts, breaches, security signals), company provisioning wizard, subscription lifecycle with an enforced transition graph, a 51-entry entitlement catalogue, per-plan entitlement editing, usage metering with server-side limit enforcement, module dependency checks, time-limited auditable Support Access, and an append-only platform audit log. No platform role holds tenant HRMS permissions |
 | **Multi-tenancy & auth** | Shared-schema tenancy with `tenant_id` on every table, JWT access + rotating refresh tokens (httpOnly cookie, revocation), brute-force rate limiting, optional per-tenant white-label branding (logo, colors, login page) applied as live CSS variables |
 | **RBAC** | `module.action[:scope]` permissions (own/team/company), 7 seeded roles, editable per tenant, route + UI guards, sensitive-field masks (PAN/Aadhaar/bank encrypted AES-256-GCM) |
 | **Administration Center** | One tenant-scoped back office at `/administration` — org builder + health check, teams & positions pipeline, users & access (logins, invites, direct grants/denies, sessions), roles & permission groups with a role-comparison tool, effective-access preview/explain, per-company **module toggles** that 403 their API when off, security policies & IP restrictions, configuration version history, bulk/import/export with per-row rejection reasons, and the append-only audit trail. Cross-tenant company provisioning is gated on `platform.tenants.*` — see [`docs/administration-center.md`](docs/administration-center.md) |

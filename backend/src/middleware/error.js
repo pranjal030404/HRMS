@@ -14,7 +14,9 @@ function errorHandler(err, req, res, next) {
     message: status === 500 && env.nodeEnv === 'production' ? 'Internal server error' : err.message,
   };
   if (err.extra) body.details = err.extra;
-  if (err.sqlState) body.dbError = err.sqlMessage;
+  // Raw SQL text exposes table and column names; it is a development aid only.
+  if (err.sqlState && env.nodeEnv !== 'production') body.dbError = err.sqlMessage;
+  if (err.sqlState && env.nodeEnv === 'production' && status === 500) body.message = 'Internal server error';
   res.status(status).json(body);
 }
 

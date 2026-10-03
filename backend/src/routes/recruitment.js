@@ -5,6 +5,7 @@ const { authenticate, requirePermission } = require('../middleware/auth');
 const { logAudit } = require('../services/audit');
 const { upload, relPath } = require('../middleware/upload');
 const { crudRouter } = require('./_crud');
+const limits = require('../services/limits');
 
 const r = express.Router();
 r.use(authenticate);
@@ -23,16 +24,21 @@ r.get('/requisitions', requirePermission('recruitment.view'), asyncH(async (req,
   res.json({ data: rows });
 }));
 
-r.post('/requisitions', requirePermission('recruitment.manage'), asyncH(async (req, res) => {
+r.post('/requisitions', requirePermission('recruitment.manage'), asyncH(require('../services/limits').locked('requisition.create', async (req, res) => {
   const { title, departmentId, locationId, openings, employmentType, minExperience, maxExperience, budgetCtc, description, hiringManagerId } = req.body || {};
   if (!title) throw new HttpError(400, 'Title required');
+  // Open requisitions are a sold quantity, capped server-side (spec §14).
+  await limits.assertWithinLimit({
+    tenantId: req.user.tenant_id, entitlementKey: 'recruitment.jobs.max',
+    incoming: Number(openings || 1), action: 'requisition.create', req,
+  });
   const [ins] = await pool.query(
     `INSERT INTO requisitions (tenant_id, rcode, title, department_id, location_id, openings, employment_type, min_experience, max_experience, budget_ctc, description, hiring_manager_id, status, created_by)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'pending_approval', ?)`,
     [req.user.tenant_id, `REQ-${Date.now().toString().slice(-6)}`, title, departmentId || null, locationId || null, openings || 1, employmentType || 'full_time', minExperience || 0, maxExperience || null, budgetCtc || null, description || null, hiringManagerId || null, req.user.id]
   );
   res.status(201).json({ data: { id: ins.insertId } });
-}));
+})));
 
 r.post('/requisitions/:id/status', requirePermission('recruitment.manage'), asyncH(async (req, res) => {
   const { status, published } = req.body || {};

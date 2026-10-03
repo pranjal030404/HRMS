@@ -95,7 +95,8 @@ r.post('/login', asyncH(async (req, res) => {
   if (!email || !password) throw new HttpError(400, 'Email and password are required');
   const emailNorm = String(email).toLowerCase().trim();
   const [rows] = await pool.query(
-    `SELECT u.*, t.name AS tenant_name, t.branding, t.slug AS tenant_slug FROM users u
+    `SELECT u.*, t.name AS tenant_name, t.branding, t.slug AS tenant_slug, t.status AS tenant_status
+     FROM users u
      LEFT JOIN tenants t ON t.id = u.tenant_id
      WHERE u.email = ?`, [emailNorm]
   );
@@ -106,6 +107,15 @@ r.post('/login', asyncH(async (req, res) => {
     throw new HttpError(401, 'Invalid email or password');
   }
   if (user.status !== 'active') throw new HttpError(403, 'Account is disabled');
+  if (user.tenant_id == null) {
+    // Platform staff: the network allowlist applies before any token is issued.
+    try {
+      await require('../services/platformSecurity').assertAllowed(user, req, { stage: 'login' });
+    } catch (e) {
+      await logLoginEvent({ tenantId: null, userId: user.id, email: emailNorm, event: 'suspicious', req, details: 'Platform login refused: network address not allowed' });
+      throw e;
+    }
+  }
   // MFA challenge (spec §12): privileged or opted-in users confirm a TOTP code before tokens are issued
   if (user.mfa_enabled) {
     const challenge = jwtSign({ sub: user.id, challenge: 'mfa' }, '10m');
@@ -225,6 +235,10 @@ r.post('/refresh', asyncH(async (req, res) => {
   const [users] = await pool.query('SELECT * FROM users WHERE id = ?', [payload.sub]);
   const user = users[0];
   if (!user || user.status !== 'active') throw new HttpError(401, 'Account is disabled');
+  if (user.tenant_id && user.tenant_status === 'deleted') throw new HttpError(403, 'This company account has been deleted');
+  if (user.tenant_id && ['suspended', 'archived', 'deletion_pending'].includes(user.tenant_status)) {
+    throw new HttpError(403, `This company account is ${user.tenant_status.replace(/_/g, ' ')}`);
+  }
   await issueTokens(user, req, res);
   const access = signAccessToken(user);
   res.json({ ok: true, accessToken: access });
@@ -281,8 +295,29 @@ r.get('/me', authenticate, asyncH(async (req, res) => {
       roles: req.user.roles || [],
       deniedPermissions: req.user.deniedPermissions || [],
       isPlatformAdmin: !!req.user.isPlatformAdmin,
-      accessibleModules: req.user.accessibleModules || (await rbac.enabledModules(req.user.isPlatformAdmin ? null : u.tenant_id)),
+      isPlatformSuperAdmin: req.user.role === 'platform_super_admin',
+      accessibleModules: req.user.accessibleModules || (await rbac.enabledModules(req.user.tenant_id == null ? null : u.tenant_id)),
       branding, featureFlags: flags,
+      // Control-plane context. The UI uses this to explain *why* something is
+      // unavailable (spec §35) and to render the support-access banner (spec §21);
+      // the server re-checks every one of these independently.
+      tenantStatus: req.user.tenantStatus || null,
+      tenantReadOnly: !!req.user.tenantReadOnly,
+      plan: req.user.plan || null,
+      subscription: req.user.subscription || null,
+      entitlements: req.user.entitlements
+        ? Object.fromEntries(Object.entries(req.user.entitlements).map(([k, e]) => [k, { value: e.value, enabled: e.enabled, kind: e.kind, unit: e.unit, source: e.source }]))
+        : {},
+      supportSession: req.user.supportSession
+        ? {
+          id: req.user.supportSession.id,
+          tenantId: req.user.supportSession.tenant_id,
+          tenantName: req.user.supportSession.tenant_name,
+          reason: req.user.supportSession.reason,
+          accessType: req.user.supportSession.access_type,
+          expiresAt: req.user.supportSession.expires_at,
+        }
+        : null,
     },
   });
 }));

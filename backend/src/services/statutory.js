@@ -97,10 +97,12 @@ function annualIncomeTax(annualTaxable, params) {
     tax = Math.max(0, tax - (params.rebateAmount || 0));
   }
   // surcharge (optional simple thresholds)
+  // Only the highest threshold crossed applies. The old loop added every matching
+  // slab on top of the already-surcharged tax, so income above two thresholds was taxed
+  // at the two rates compounded rather than at the higher one.
   if (params.surchargeSlabs) {
-    for (const sc of params.surchargeSlabs) {
-      if (annualTaxable > sc.above) tax += (tax * sc.rate) / 100;
-    }
+    const hit = params.surchargeSlabs.filter((sc) => annualTaxable > sc.above).sort((a, b) => b.above - a.above)[0];
+    if (hit) tax += (tax * hit.rate) / 100;
   }
   tax += (tax * (params.cess ?? 4)) / 100;
   return tax;

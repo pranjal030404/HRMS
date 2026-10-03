@@ -28,7 +28,7 @@ r.get('/runs', requirePermission('payroll.view'), asyncH(async (req, res) => {
   res.json({ data: rows.map((x) => ({ ...x, totals: typeof x.totals === 'string' ? JSON.parse(x.totals || '{}') : x.totals, exceptions: typeof x.exceptions === 'string' ? JSON.parse(x.exceptions || '[]') : x.exceptions })) });
 }));
 
-r.post('/runs', requirePermission('payroll.calculate'), asyncH(async (req, res) => {
+r.post('/runs', requirePermission('payroll.calculate'), asyncH(require('../services/limits').locked('payroll.run', async (req, res) => {
   const { year, month, periodYear, periodMonth, payDate, monthDays } = req.body || {};
   // Accept both spellings — responses expose period_year/period_month, so callers reasonably
   // send periodYear/periodMonth. Responses are left unchanged for frontend compatibility.
@@ -38,13 +38,28 @@ r.post('/runs', requirePermission('payroll.calculate'), asyncH(async (req, res) 
   const [dupe] = await pool.query('SELECT id FROM payroll_runs WHERE tenant_id = ? AND period_year = ? AND period_month = ?', [req.user.tenant_id, y, m]);
   if (dupe[0]) throw new HttpError(409, 'A payroll run already exists for this period');
   const { daysInMonth } = monthRange(y, m);
+  // Metered entitlement (spec §13, §14): a tenant that has run out of monthly
+  // payroll runs is told so, and the counter is advanced only once the run exists
+  // — a refused request must not consume allowance.
+  const limits = require('../services/limits');
+  await limits.assertWithinLimit({
+    tenantId: req.user.tenant_id, entitlementKey: 'payroll_runs.month', incoming: 1,
+    action: 'payroll.create_run', req,
+  });
   const [ins] = await pool.query(
     `INSERT INTO payroll_runs (tenant_id, period_year, period_month, pay_date, month_days) VALUES (?,?,?,?,?)`,
     [req.user.tenant_id, y, m, payDate || null, monthDays || daysInMonth]
   );
+  // Awaited, not fire-and-forget: payroll runs are low-volume and this is a
+  // billing counter. A metered figure that lags its own write path is a figure
+  // the platform console will under-report.
+  await require('../services/usage').increment(req.user.tenant_id, 'payroll_runs.month', 1, {
+    source: 'payroll_run', referenceType: 'payroll_run', referenceId: ins.insertId,
+    actorUserId: req.user?.id, requestId: req.requestId, metadata: { year: y, month: m },
+  }).catch((e) => console.error('[usage] payroll run metering failed:', e.message));
   await logAudit({ tenantId: req.user.tenant_id, actor: req.user, action: 'payroll.create_run', entityType: 'payroll_run', entityId: ins.insertId, after: { y, m }, req });
   res.status(201).json({ data: { id: ins.insertId } });
-}));
+})));
 
 r.get('/runs/:id', requirePermission('payroll.view'), asyncH(async (req, res) => {
   const [runs] = await pool.query('SELECT * FROM payroll_runs WHERE id = ? AND tenant_id = ?', [req.params.id, req.user.tenant_id]);

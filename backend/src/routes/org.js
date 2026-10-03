@@ -26,15 +26,15 @@ r.use('/grades', crudRouter({
 }));
 r.use('/locations', crudRouter({
   table: 'locations', perm: 'org.manage', fields: ['name', 'code', 'address', 'city', 'state', 'timezone', 'status'],
-  required: ['name'], searchable: ['name', 'city', 'state'],
+  required: ['name'], searchable: ['name', 'city', 'state'], limit: 'locations.max',
 }));
 r.use('/cost-centers', crudRouter({
   table: 'cost_centers', perm: 'org.manage', fields: ['name', 'code', 'status'],
   required: ['name'], searchable: ['name', 'code'],
 }));
 r.use('/legal-entities', crudRouter({
-  table: 'legal_entities', perm: 'org.manage', fields: ['name', 'code', 'entity_type', 'cin', 'pan', 'gstin', 'address', 'city', 'state', 'status'],
-  required: ['name'], searchable: ['name', 'code', 'gstin'],
+  table: 'legal_entities', perm: 'org.manage', fields: ['name', 'code', 'entity_type', 'cin', 'pan', 'tan', 'gstin', 'address', 'address_line1', 'city', 'state', 'state_code', 'pincode', 'bank_name', 'bank_ifsc', 'pf_code', 'esi_code', 'pt_state', 'is_primary', 'status'],
+  required: ['name'], searchable: ['name', 'code', 'gstin'], boolFields: ['is_primary'], limit: 'legal_entities.max',
 }));
 r.use('/business-units', crudRouter({
   table: 'business_units', perm: 'org.manage', fields: ['name', 'code', 'head_employee_id', 'parent_id', 'status'],

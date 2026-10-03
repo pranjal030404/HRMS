@@ -1,4 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { getToken } from '../api';
 
 // ---------- Toast ----------
@@ -22,15 +23,51 @@ export function ToastProvider({ children }) {
 export const useToast = () => useContext(ToastCtx);
 
 // ---------- Modal ----------
-export function Modal({ title, onClose, children, footer, wide }) {
+/** Renders at <body> so no ancestor (overflow, transform, filter) can clip a dialog. */
+export function Overlay({ children, ...rest }) {
+  return createPortal(<div className="overlay" {...rest}>{children}</div>, document.body);
+}
+
+const FOCUSABLE = 'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
+
+/**
+ * Dialog behaviour shared by Modal and Drawer: Escape closes, Tab is trapped inside,
+ * focus moves in on open and returns to the opener on close, and the page behind
+ * does not scroll.
+ */
+function useDialog(onClose) {
+  const ref = useRef(null);
   useEffect(() => {
-    const h = (e) => e.key === 'Escape' && onClose?.();
-    window.addEventListener('keydown', h);
-    return () => window.removeEventListener('keydown', h);
+    const opener = document.activeElement;
+    const node = ref.current;
+    const first = node && node.querySelector(FOCUSABLE);
+    if (first) first.focus(); else node?.focus();
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const onKey = (e) => {
+      if (e.key === 'Escape') { onClose?.(); return; }
+      if (e.key !== 'Tab' || !node) return;
+      const items = [...node.querySelectorAll(FOCUSABLE)];
+      if (!items.length) { e.preventDefault(); return; }
+      const a = items[0]; const z = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === a) { e.preventDefault(); z.focus(); }
+      else if (!e.shiftKey && document.activeElement === z) { e.preventDefault(); a.focus(); }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      document.body.style.overflow = prevOverflow;
+      if (opener && opener.focus) opener.focus();
+    };
   }, [onClose]);
-  return (
+  return ref;
+}
+
+export function Modal({ title, onClose, children, footer, wide }) {
+  const ref = useDialog(onClose);
+  return createPortal(
     <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose?.()}>
-      <div className={'modal' + (wide ? ' wide' : '')}>
+      <div className={'modal' + (wide ? ' wide' : '')} role="dialog" aria-modal="true" aria-label={title} ref={ref} tabIndex={-1}>
         <div className="modal-h">
           <h3>{title}</h3>
           <button className="x-btn" onClick={onClose} aria-label="Close">×</button>
@@ -38,7 +75,26 @@ export function Modal({ title, onClose, children, footer, wide }) {
         <div className="modal-b">{children}</div>
         {footer && <div className="modal-f">{footer}</div>}
       </div>
-    </div>
+    </div>,
+    document.body
+  );
+}
+
+/** Right-hand panel for contextual detail and longer workflows. */
+export function Drawer({ title, onClose, children, footer, width = 560 }) {
+  const ref = useDialog(onClose);
+  return createPortal(
+    <div className="overlay drawer-overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose?.()}>
+      <aside className="drawer" style={{ width }} role="dialog" aria-modal="true" aria-label={title} ref={ref} tabIndex={-1}>
+        <div className="modal-h">
+          <h3>{title}</h3>
+          <button className="x-btn" onClick={onClose} aria-label="Close">×</button>
+        </div>
+        <div className="modal-b">{children}</div>
+        {footer && <div className="modal-f">{footer}</div>}
+      </aside>
+    </div>,
+    document.body
   );
 }
 
@@ -70,6 +126,15 @@ export function TextField({ label, value, onChange, type = 'text', hint, require
   return (
     <Field label={label} hint={hint}>
       <input type={type} value={value ?? ''} placeholder={placeholder} required={required} min={min} max={max}
+        onChange={(e) => onChange(e.target.value)} />
+    </Field>
+  );
+}
+
+export function TextAreaField({ label, value, onChange, hint, rows = 3, required, placeholder }) {
+  return (
+    <Field label={label} hint={hint}>
+      <textarea rows={rows} value={value ?? ''} placeholder={placeholder} required={required}
         onChange={(e) => onChange(e.target.value)} />
     </Field>
   );

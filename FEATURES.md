@@ -4,7 +4,7 @@ A multi-tenant HRMS platform: one **Platform Super Admin** manages companies (te
 
 Implements the *Arthvex HRMS — Complete Product Specification v2.0* (Sept 2026). LMS / learning management is intentionally **out of scope** — it belongs to the standalone Arthvex LMS, which connects through the API contract described in §Integrations below.
 
-**Stack:** Node.js + Express + MySQL (backend) · React + Vite (frontend) · JWT auth · permission-based access control (`module.action[:scope]`, scopes: own / team / department / company).
+**Stack:** Node.js + Express + MySQL / MariaDB (backend) · React + Vite (frontend) · JWT auth · permission-based access control (`module.action[:scope]`, scopes: own / team / department / company).
 
 ---
 
@@ -12,7 +12,7 @@ Implements the *Arthvex HRMS — Complete Product Specification v2.0* (Sept 2026
 
 | # | Login Type | Main Purpose | Typical Access |
 |---|------------|--------------|----------------|
-| 1 | **Administrator — Console** (`platform_super_admin`) | Full platform + company control (via `/admin`) | Everything — every permission, every module (including Travel, Workforce, AI, Integrations even if disabled per company), cross-tenant Companies console, real data access when bound to a company |
+| 1 | **Administrator — Console** (`platform_super_admin`) | Full platform control (via `/admin` and `/platform`) | All 28 `platform.*` permissions, cross-tenant company directory, provisioning, lifecycle, support access. **No tenant HRMS permission** — customer data is reached only through a Support Access session |
 | 2 | **Platform Super Admin** (`platform_super_admin`) | System / platform management (no company bound) | Cross-tenant view/provisioning; HR pages may be empty when not scoped to a specific tenant |
 | 3 | **Company Owner** (`company_owner`) | Full company control | Everything in their company except platform management; manages users, roles, settings |
 | 4 | **HR Admin** (`hr_admin`) | Manage employees & HR operations | Employees, org structure, attendance, leave, documents & letters, performance, recruitment, onboarding/exit, assets, announcements, reports |
@@ -24,6 +24,12 @@ Implements the *Arthvex HRMS — Complete Product Specification v2.0* (Sept 2026
 | 10 | **Employee** (`employee`) | Self-service | Attendance punch-in/out, leave requests, expenses, loans, payslips, documents, tickets, profile |
 | 11 | **Auditor** (`auditor`) | Read-only compliance review | View employees, attendance, leave, payroll, expenses, billing, reports, audit logs — no edits |
 
+| 12 | **Platform Billing Admin** (`platform_billing_admin`) | ARTHVEX commercial operations | Plans, subscriptions, trials, add-ons, invoices, payments, refunds, usage, audit view. No HR data, cannot take support access |
+| 13 | **Platform Support Admin** (`platform_support_admin`) | ARTHVEX customer support | Support tickets, support-access sessions, company directory, usage, security view. Cannot change billing |
+| 14 | **Platform Security Admin** (`platform_security_admin`) | ARTHVEX security | Security policy, incidents, support visibility, audit export |
+| 15 | **Platform Auditor** (`platform_auditor`) | Read-only oversight of the platform | Every platform read and export, no writes |
+| 16 | **Custom platform roles** (`platform_custom_*`) | Narrow roles for other ARTHVEX staff | Created in Platform → Roles & permissions; limited to permissions the creator holds |
+
 Roles are permission sets (editable per company in **Settings → Users & roles**). Menus, pages and API endpoints all gate on permissions, so custom roles work out of the box.
 
 ---
@@ -33,7 +39,28 @@ Roles are permission sets (editable per company in **Settings → Users & roles*
 ### Administration Console (`http://localhost:5173/admin`)
 | Email | Password | Role | Notes |
 |---|----------|------|-------|
-| `admin@arthvex.com` | `Admin@12345` | Platform Super Admin (bound to Arthvex) | Every permission, every module, real data, cross-tenant Companies console |
+| `admin@arthvex.com` | `Admin@12345` | Platform Super Admin (bound to Arthvex) | 28 `platform.*` permissions + the cross-tenant company directory. Holds **no** tenant HRMS permission — to work inside Arthvex, sign in as `owner@arthvex.com` |
+
+### Platform Console (`http://localhost:5173/platform`)
+Sign in at `/admin` or `/login`; an account with no company bound lands here instead of the HRMS.
+
+| Email | Password | Role | Notes |
+|---|----------|------|-------|
+| `super@platform.arthvex.com` | `Platform@123` | Platform Super Admin | Everything: provisioning, lifecycle, exports, deletion |
+| `billing@platform.arthvex.com` | `Platform@123` | Platform Billing Admin | Plans, subscriptions, usage, audit |
+| `support@platform.arthvex.com` | `Platform@123` | Platform Support Admin | Support Access, company directory, usage, security |
+| `security@platform.arthvex.com` | `Platform@123` | Platform Security Admin | Security posture, support visibility, audit export |
+| `auditor@platform.arthvex.com` | `Platform@123` | Platform Auditor | Reads everything, writes nothing |
+
+No platform role holds any tenant HRMS permission. Reaching a customer's records
+requires a Support Access session — reasoned, time-boxed, and every request under
+it (reads included) is written to that customer's audit trail.
+
+### Customer Company Logins
+| Email | Password | Role | Plan / State |
+|---|---|---|---|
+| `planthead@demomfg.com` | `Password@123` | Company Owner (Ramesh Kulkarni) | Growth · active |
+| `owner@demostartup.com` | `Password@123` | Company Owner | Trial · trialing (intentionally over its 25-employee limit, so limit enforcement is visible) |
 
 ### Employee & Manager Login (`http://localhost:5173/login`)
 | Email | Password | Role | Notes |
@@ -54,6 +81,124 @@ Demo dataset: company *Arthvex Technologies Pvt Ltd* (Bengaluru + Pune offices),
 Payroll demo data worth trying first: a **submitted arrears adjustment** awaiting payroll approval, a bonus plan with awards in `proposed`/`approved` states (approving one books a payroll adjustment automatically), an approved-but-unpaid expense claim, and an internal non-billable project that acts as the default sink for non-billable time.
 
 **Demo API key** (for the `/api/v1` public API, shown in Integrations → API Keys): `akv1_arthvex_demo_key_2026_lms_sync_0001`
+
+---
+
+## 2b. Platform Control Plane
+
+The layer above tenants. Full reference: [`docs/platform-control-plane.md`](docs/platform-control-plane.md).
+
+| Area | What exists |
+|---|---|
+| **Entitlements** | A 51-entry catalogue (boolean feature switches, numeric caps, metered quantities) resolved in exactly one place: `platform default → plan grant → tenant override → subscription state`. A value of `0` means *not included*, which is distinct from *unlimited* |
+| **Plans** | trial / starter / growth / business / enterprise / custom, each editing through the catalogue. Editing a plan re-resolves every tenant on it immediately and requires a reason. Legacy plan names (`standard`, `professional`, `basic`, `pro`) alias onto real plans |
+| **Subscriptions** | An explicit transition graph — an illegal jump such as `cancelled → active` is refused. Every move writes a subscription event, a lifecycle-history row *and* a platform audit row |
+| **Tenant lifecycle** | `provisioning · trial · active · past_due · grace_period · suspended · cancelled · archived · deletion_pending · deleted`. Suspended and cancelled are **read-only, not locked out**: the company keeps reading its own payroll, every write returns 402 |
+| **Usage metering** | Counters derived from source tables (so they cannot drift) plus metered increments, with a per-tenant, per-period history. Enforcement happens on the write path, not as an advisory warning |
+| **Module dependencies** | A graph checked *before* any write, so an invalid combination fails at review time rather than mid-transaction. Disabling a module never deletes data |
+| **Provisioning wizard** | One transaction: tenant, roles, first legal entity, subscription, module set and the owner's account — or nothing at all |
+| **Support Access** | Reason (≥10 chars), type, ticket reference, duration capped at 8 hours. Reads are logged, not just writes. `expires_at` is `NOT NULL`; there is no permanent-session row to create |
+| **Platform audit** | Append-only, with before/after values, reason, actor, role, IP and request id. Deliberately separate from the tenant `audit_logs`, because it answers a different question: *what did ARTHVEX do* |
+
+### Enforced on the write path today
+`employees.max` (create, both imports) · `active_users.max` · `admins.max` · `locations.max` ·
+`legal_entities.max` · `recruitment.jobs.max` · `api_keys.max` · `webhooks.max` · `documents.stored` ·
+`storage.max_gb` · `payroll_runs.month` · `workflow.executions.month` · `ai.requests.month` ·
+`api.requests.month` (metered at the API boundary, with `X-RateLimit-*` response headers).
+Capped creations run under a per-company lock, so simultaneous requests cannot exceed a cap.
+
+### Known gaps in metering
+Counters for `storage.max_gb` depend on upload paths recording file size; confirm on your data before relying on it for billing.
+
+---
+
+## 2c. Platform Console (`/platform`)
+
+A separate application shell for ARTHVEX staff, with its own navigation (grouped Overview / Customers / Access & security,
+collapsible, remembers its state), breadcrumb header, company search, loading skeletons, empty and error states.
+
+| Page | What it does |
+|---|---|
+| **Dashboard** | Company, MRR, employee, at-risk, support-session, limit-breach, security-alert and integration-failure figures, plus a live **system health strip** (API uptime, DB latency, 24h webhook outcomes, deletion and export queues) — measured values only |
+| **Companies** | Server-side search (name, slug, ID, owner email, domain) and filters (state, plan, industry, subscription, dates, activity, employee count); sortable table with column toggles; provisioning wizard |
+| **Company detail** | KPI strip; tabs for Overview, Modules, Entitlements, Usage & limits, Subscription, Users, Roles, Security, Branding, Domains, Integrations, Audit, Support access, Configuration, Data & lifecycle |
+| **Edit / delete company** | Edit profile (reason required, audited with before/after). Delete with a grace period (cancellable) or **immediately** (Super Admin only: reason + slug typed back + password; refused while a live subscription exists; a tombstone row is kept for the audit trail) |
+| **Subscription tab** | Change plan with a **downgrade preview**, change state, edit terms, issue invoice, **extend / convert trial**, **cancel now or at period end**, **attach / remove add-ons** |
+| **Subscriptions · Invoices & payments** | Server-paged sortable tables; record payment, void, **refund** |
+| **Plans · Entitlements & usage** | Plan editing re-resolves every company on the plan; usage and limit breaches |
+| **Support tickets** | ARTHVEX's own customer support: priority, status, assignee, SLA (only where a policy is configured), internal vs customer-visible notes, resolution required to close, **request support access from the ticket** |
+| **Support access** | Time-limited, reasoned sessions with a ticket reference; every request under a session is logged; a read-only session cannot write |
+| **Operators** | Platform staff accounts; role assignment; MFA reset |
+| **Roles & permissions** | Role cards, a permission matrix, and **create / edit / delete custom platform roles** (cannot exceed the creator's own permissions; cannot delete a role still in use; built-ins are protected) |
+| **Operations** | In-app alerts (trial ending, payment failed, limit near / reached, plan changed, cancellation requested, incidents), **incident tracking** (severity, systems, timeline, root cause + resolution to resolve), **maintenance windows** (platform-wide or per company) |
+| **Platform security · Audit log** | Platform MFA / IP allow-list / session-age policy; append-only audit with filters |
+
+Company-level **role management from the console**: create, edit and delete a company's custom roles inside a support-access
+session (recorded in both audit trails).
+
+---
+
+## 2d. Commercial layer (plans → billing → lifecycle)
+
+Reference: [`docs/commercial-saas.md`](docs/commercial-saas.md).
+
+- **Add-ons** — purchasable extras with `grants` (cap increments or feature switches) layered into the entitlement resolver:
+  `platform default → plan → add-ons → tenant override`. One live attachment per add-on per company.
+- **Trials** — start, extend (≤ 2 times, ≤ 30 days, reason required, atomic), convert to paid (idempotent), expire, with
+  extension count / reason / converted-at recorded. Operators are alerted 3 days before a trial ends.
+- **Payments** — a provider abstraction (`services/payments.js`) with a **signed webhook** (`POST /api/billing-webhooks/signed`,
+  HMAC-SHA256, 5-minute replay window). Idempotent on the provider's event id and on its payment reference; supports
+  `payment.succeeded`, `payment.failed`, `refund.succeeded`. The UI never marks a payment successful by itself.
+  *No gateway-specific adapter (Razorpay / Stripe) ships — only the generic signed webhook.*
+- **Invoices & refunds** — integer-paise arithmetic, row-locked payment application, over-payment and over-refund refused,
+  a refund re-opens a paid invoice; tax percentage and a validated GSTIN on billing contacts.
+- **Downgrades** — `plan-preview` lists every cap already exceeded and every module that would be lost; records are always kept,
+  nothing further can be added until usage is back under the cap or the plan is upgraded.
+- **Cancellation** — immediate or at period end, with reason / requested-by / effective date; withdrawable before it takes effect;
+  never deletes data; the lifecycle sweeper ends it at the period end instead of renewing.
+- **Grace and suspension** — past due → grace period → suspended. The company can always sign in, read every record, export, and
+  contact ARTHVEX; writes are refused with 402 by one global gate.
+- **Maintenance mode** — a window blocks company users and API keys with the message and end time; platform staff are never blocked;
+  only the Super Admin can schedule one.
+- **Usage alerts** — warning / limit notifications to operators and in-app to company owners, once per month per condition.
+- **Support SLA policies, retention targets, billing contacts, platform notifications, incidents** — all stored as data;
+  nothing is promised or deleted unless configured.
+
+### Company self-service — "Plan & billing" (`/account`, company owners)
+Plan, status and trial days left · usage versus limits (with add-ons) · invoices (read-only) · cancel at period end / keep subscription ·
+**Setup health** (company setup, payroll readiness with the exact reason payroll cannot run, security) ·
+**Data quality** (record IDs and codes only — no pay or identity data) · billing / finance / legal / technical contacts ·
+raise and follow ARTHVEX support tickets (only customer-visible notes are shown).
+
+---
+
+## 2e. Security & reliability hardening
+
+Full findings with tests: [`SECURITY-AUDIT.md`](SECURITY-AUDIT.md). Operations and backup guidance: [`docs/operations-runbook.md`](docs/operations-runbook.md).
+
+- **Tenant lifecycle enforcement** — suspended / past-due / cancelled companies are read-only on *every* write route (one global gate), not only routes that check a limit.
+- **Support-access gate** — any administration request naming another company needs a live session; read-only sessions cannot write; each call is logged against the session.
+- **Concurrency** — per-company locks around employee, capped-table, user-seat, document, requisition, payroll-run and import creation; one live subscription per company enforced by the database.
+- **Secrets & environments** — production refuses to start with missing or published example secrets; `db:seed` refuses in production without an explicit override; demo credentials are shown only in a development build; the whole API is rate-limited in production; SQL error text is never returned in production.
+- **API keys** — expiry (`expiresInDays`), revocation, trial / grace-period companies served, maintenance-aware.
+- **Files** — photos, logos and announcements are served only to the owning company.
+- **Platform MFA** — on by default in production (saved policy always wins).
+- **Sweeper** — one instance sweeps at a time (MySQL named lock).
+- **AI assistant** — company-wide answers require company-wide scope; own/team holders are refused.
+- **Imports** — administration employee import now honours the employee cap and its own write permission; dry-run (the default) writes nothing.
+- **Payroll & statutory** — unpaid leave split across months, mid-month joiner / leaver proration, single highest surcharge band, and the **employer EPF share** added to the PF return total (unit-tested).
+- **Frontend guards** — tenant routes check the same permissions as the navigation; platform accounts are redirected to the console.
+- **Observability** — structured request log in production, `GET /api/platform/health`, request ids.
+
+### Not implemented (be aware)
+Plan versioning / grandfathering · coupons and credits · tiered / per-employee pricing engine · CGST/SGST/IGST split on ARTHVEX's own
+invoices · platform email-template editor and email delivery of platform alerts · SSO · backup / restore tooling (infrastructure) ·
+distributed job queue · percentage feature rollout.
+
+### Tests
+`cd backend && npm test` — 187 tests: tenant isolation, platform role separation, entitlements and overrides, billing and webhook
+idempotency, trial / cancellation / downgrade, add-ons, support tickets and access, maintenance, identity lifecycle,
+concurrency at caps, imports, files, AI scoping, payroll and statutory arithmetic. Run `node src/scripts/migrate.js` after pulling.
 
 ---
 
@@ -182,8 +327,8 @@ Full guide: [`docs/administration-center.md`](docs/administration-center.md)
 - Notifications bell (in-app + email events)
 
 ### Platform Admin (Super Admin only)
-- Create companies (tenant + admin user + seeded roles), suspend/activate tenants
-- Feature flags & plan per tenant, platform-wide file access
+- Create, edit, suspend/activate and delete companies (see §2c); feature flags and plan per tenant
+- Everything under the Platform Console (§2c) and commercial layer (§2d); platform-wide file access still requires a support session
 
 ---
 
@@ -290,4 +435,6 @@ cd ../frontend && npm install
 npm run dev          # app on http://localhost:5173
 ```
 
-Seeding wipes and recreates demo data — don't run it against a database with real data.
+Seeding wipes and recreates demo data — don't run it against a database with real data. It refuses to run when `NODE_ENV=production`
+unless `ALLOW_DESTRUCTIVE_SEED=yes-wipe-everything` is set. After pulling new code run `node src/scripts/migrate.js`.
+For payment webhooks set `BILLING_WEBHOOK_SECRET`; for production set real `JWT_*`, `ENCRYPTION_KEY` and `DB_PASSWORD` (see `backend/.env.example`).

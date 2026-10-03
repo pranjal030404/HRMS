@@ -11,6 +11,8 @@ const { notifyEvent } = require('../services/notify');
 const { emitEvent } = require('../services/webhooks');
 const { upload, relPath } = require('../middleware/upload');
 const { parseCsv, toCsv } = require('../utils/csv');
+const limits = require('../services/limits');
+const usage = require('../services/usage');
 
 const r = express.Router();
 r.use(authenticate);
@@ -84,13 +86,21 @@ r.get('/org-chart', requirePermission('employee.view'), asyncH(async (req, res) 
 }));
 
 // ---------- Create employee ----------
-r.post('/', requirePermission('employee.create'), asyncH(async (req, res) => {
-  const data = pick(req.body, EMP_FIELDS);
-  for (const f of ['first_name', 'last_name', 'email', 'joined_on']) {
-    if (!data[f]) throw new HttpError(400, `${f} is required`);
-  }
-  const [dupe] = await pool.query('SELECT id FROM employees WHERE tenant_id = ? AND email = ?', [req.user.tenant_id, data.email]);
-  if (dupe[0]) throw new HttpError(409, 'An employee with this email already exists');
+async function createEmployee(req, res) {
+   const data = pick(req.body, EMP_FIELDS);
+   for (const f of ['first_name', 'last_name', 'email', 'joined_on']) {
+     if (!data[f]) throw new HttpError(400, `${f} is required`);
+   }
+   // The employee cap is a commercial limit, so it is enforced here, on the
+   // server, from the tenant's plan/override — never from a disabled button
+   // (spec §14). Reaching it blocks employee #501 and nothing else: existing
+   // staff keep their payroll, payslips and history (spec §15).
+   await limits.assertWithinLimit({
+     tenantId: req.user.tenant_id, entitlementKey: 'employees.max', incoming: 1,
+     action: 'employee.create', req,
+   });
+   const [dupe] = await pool.query('SELECT id FROM employees WHERE tenant_id = ? AND email = ?', [req.user.tenant_id, data.email]);
+   if (dupe[0]) throw new HttpError(409, 'An employee with this email already exists');
 
   // employee code auto
   let code = req.body.employee_code;
@@ -144,8 +154,14 @@ r.post('/', requirePermission('employee.create'), asyncH(async (req, res) => {
   await logAudit({ tenantId: req.user.tenant_id, actor: req.user, action: 'employee.create', entityType: 'employee', entityId: ins.insertId, after: { code, email: data.email, status }, req });
   await emitEvent({ tenantId: req.user.tenant_id, eventType: 'employee.created', payload: { employeeId: ins.insertId, code, email: data.email, status } });
   const [rows] = await pool.query('SELECT id, employee_code, first_name, last_name, email, status FROM employees WHERE id = ?', [ins.insertId]);
+  // Keep the derived counter fresh so the next limit check sees this row.
+  await usage.recompute(req.user.tenant_id, { source: 'employee_create', actorUserId: req.user.id, requestId: req.requestId });
   res.status(201).json({ data: rows[0], tempPassword, portalCreated: !!tempPassword });
-}));
+}
+// The employee cap and the generated employee code are both "read, then insert", so the
+// whole creation runs under a per-company lock; see limits.withTenantLock.
+r.post('/', requirePermission('employee.create'), asyncH((req, res) =>
+  limits.withTenantLock(req.user.tenant_id, 'employee.create', () => createEmployee(req, res))));
 
 // ---------- Profile ----------
 r.get('/:id', requirePermission('employee.view'), asyncH(async (req, res) => {
@@ -235,7 +251,7 @@ r.delete('/:id', requirePermission('employee.delete'), asyncH(async (req, res) =
 }));
 
 // ---------- Bulk import (CSV) ----------
-r.post('/import', requirePermission('employee.import'), upload('documents', { fieldName: 'file', maxSizeMb: 10 }), asyncH(async (req, res) => {
+async function importEmployees(req, res) {
   if (!req.file) throw new HttpError(400, 'CSV file required');
   const fs = require('fs');
   const content = fs.readFileSync(req.file.path, 'utf8');
@@ -246,6 +262,18 @@ r.post('/import', requirePermission('employee.import'), upload('documents', { fi
   const errors = [];
   let success = 0;
   const seen = new Set();
+
+  // A bulk import is the easiest way to blow past a commercial cap, so the whole
+  // file is checked against the remaining headroom before a single row is written.
+  const headroom = await limits.assertWithinLimit({
+    tenantId: req.user.tenant_id, entitlementKey: 'employees.max',
+    incoming: rows.length - 1, onExhausted: 'warn', action: 'employee.import', req,
+  });
+  if (headroom.warning && Number(headroom.projected) > Number(headroom.limit)) {
+    throw new HttpError(402,
+      `This import would take the company to ${headroom.projected} employees, over the limit of ${headroom.limit}. Split the file, or ask ARTHVEX to raise the limit.`,
+      { current: headroom.current, limit: headroom.limit, requested: rows.length - 1, limitSource: headroom.entitlement.source });
+  }
 
   for (let i = 1; i < rows.length; i++) {
     const lineNo = i + 1;
@@ -299,8 +327,12 @@ r.post('/import', requirePermission('employee.import'), upload('documents', { fi
     [req.user.tenant_id, req.file.originalname, req.user.id, rows.length - 1, success, errors.length, JSON.stringify(errors)]
   );
   await logAudit({ tenantId: req.user.tenant_id, actor: req.user, action: 'employee.import', entityType: 'import', entityId: logIns.insertId, after: { success, errors: errors.length }, req });
+  await usage.recompute(req.user.tenant_id, { source: 'employee_import', actorUserId: req.user.id, requestId: req.requestId });
   res.json({ data: { total: rows.length - 1, success, errors } });
-}));
+}
+// Cap check + inserts must not interleave with another creation in the same company.
+r.post('/import', requirePermission('employee.import'), upload('documents', { fieldName: 'file', maxSizeMb: 10 }), asyncH((req, res) =>
+  limits.withTenantLock(req.user.tenant_id, 'employee.create', () => importEmployees(req, res))));
 
 r.get('/import/template', requirePermission('employee.import'), asyncH(async (req, res) => {
   const csv = toCsv(

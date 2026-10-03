@@ -26,7 +26,7 @@ admin.get('/scopes', requirePermission('integration.manage'), (req, res) => res.
 
 admin.get('/keys', requirePermission('integration.manage'), asyncH(async (req, res) => {
   const [rows] = await pool.query(
-    `SELECT id, name, key_prefix, scopes, last_used_at, revoked_at, created_at FROM api_keys
+    `SELECT id, name, key_prefix, scopes, last_used_at, expires_at, revoked_at, created_at FROM api_keys
      WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 100`,
     [req.user.tenant_id]
   );
@@ -34,17 +34,23 @@ admin.get('/keys', requirePermission('integration.manage'), asyncH(async (req, r
 }));
 
 admin.post('/keys', requirePermission('integration.manage'), asyncH(async (req, res) => {
-  const { name, scopes } = req.body || {};
+  const { name, scopes, expiresInDays } = req.body || {};
   if (!name) throw new HttpError(400, 'name required');
+  const days = expiresInDays == null || expiresInDays === '' ? null : Number(expiresInDays);
+  if (days !== null && (!Number.isInteger(days) || days < 1 || days > 3650)) throw new HttpError(400, 'expiresInDays must be between 1 and 3650');
   const allowed = Array.isArray(scopes) ? scopes.filter((s) => SCOPES.includes(s)) : ['employee.read'];
   if (!allowed.length) throw new HttpError(400, 'At least one valid scope required');
+  // Enforced cap (spec §14): a tenant that bought N API keys cannot create N+1.
+  await require('../services/limits').assertWithinLimit({
+    tenantId: req.user.tenant_id, entitlementKey: 'api_keys.max', incoming: 1, action: 'api_key.create', req,
+  });
   const secret = crypto.randomBytes(24).toString('base64url');
   const key = `akv1_${secret}`;
   const keyPrefix = key.slice(0, 12);
   const keyHash = sha256(key);
   const [ins] = await pool.query(
-    'INSERT INTO api_keys (tenant_id, name, key_prefix, key_hash, scopes, created_by) VALUES (?,?,?,?,?,?)',
-    [req.user.tenant_id, name, keyPrefix, keyHash, JSON.stringify(allowed), req.user.id]
+    'INSERT INTO api_keys (tenant_id, name, key_prefix, key_hash, scopes, created_by, expires_at) VALUES (?,?,?,?,?,?, ' + (days ? 'DATE_ADD(NOW(), INTERVAL ? DAY)' : 'NULL') + ')',
+    [req.user.tenant_id, name, keyPrefix, keyHash, JSON.stringify(allowed), req.user.id, ...(days ? [days] : [])]
   );
   await logAudit({ tenantId: req.user.tenant_id, actor: req.user, action: 'api_key.create', entityType: 'api_key', entityId: ins.insertId, after: { name, scopes: allowed }, req });
   // full key is shown exactly once
@@ -74,6 +80,11 @@ admin.post('/webhooks', requirePermission('integration.manage'), asyncH(async (r
   const { url, events } = req.body || {};
   if (!url || !/^https?:\/\//.test(url)) throw new HttpError(400, 'Valid http(s) url required');
   if (!Array.isArray(events) || !events.length) throw new HttpError(400, 'events required');
+  // Enforced cap (spec §14). Re-enabling a deactivated webhook via PUT is not
+  // charged again — it was already counted against the cap when it was created.
+  await require('../services/limits').assertWithinLimit({
+    tenantId: req.user.tenant_id, entitlementKey: 'webhooks.max', incoming: 1, action: 'webhook.create', req,
+  });
   const secret = 'whsec_' + crypto.randomBytes(20).toString('hex');
   const [ins] = await pool.query(
     'INSERT INTO webhook_subscriptions (tenant_id, url, secret, events, created_by) VALUES (?,?,?,?,?)',
@@ -183,10 +194,40 @@ async function apiKeyAuth(req, res, next) {
     const [rows] = await pool.query('SELECT * FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL', [sha256(String(key))]);
     const k = rows[0];
     if (!k) return errorEnvelope(res, 401, 'unauthorized', 'Invalid or revoked API key');
+    if (k.expires_at && new Date(k.expires_at) <= new Date()) return errorEnvelope(res, 401, 'key_expired', 'This API key has expired');
     const [tenants] = await pool.query('SELECT id, status FROM tenants WHERE id = ?', [k.tenant_id]);
-    if (!tenants[0] || tenants[0].status !== 'active') return errorEnvelope(res, 403, 'tenant_suspended', 'Company account suspended');
+    // Trial and billing-grace companies are legitimate customers; only states that
+    // revoke access (suspended, cancelled, archived, deleted…) stop their keys.
+    if (!tenants[0] || !['active', 'trial', 'past_due', 'grace_period'].includes(tenants[0].status)) return errorEnvelope(res, 403, 'tenant_suspended', 'Company account suspended');
+
+    const maint = await require('../services/maintenance').blockingFor(k.tenant_id);
+    if (maint) return errorEnvelope(res, 503, 'maintenance', maint.message, { endsAt: maint.ends_at });
+
+    // Metering and the commercial cap are enforced here, at the one place every
+    // public API call passes through (spec §13, §14). A tenant that bought the
+    // Integrations module but not the API, or has run out of requests, is told
+    // exactly that rather than getting a generic 403.
+    const limits = require('../services/limits');
+    let check;
+    try {
+      check = await limits.assertWithinLimit({ tenantId: k.tenant_id, entitlementKey: 'api.requests.month', incoming: 1, action: 'api.request' });
+    } catch (e) {
+      if (e.status === 402) {
+        return errorEnvelope(res, 402, 'quota_exceeded', e.message, { ...(e.extra || {}), upgrade: 'Upgrade the plan or request a higher API quota from ARTHVEX' });
+      }
+      throw e;
+    }
+
     req.apiKey = { id: k.id, tenantId: k.tenant_id, scopes: typeof k.scopes === 'string' ? JSON.parse(k.scopes) : (k.scopes || []) };
     await pool.query('UPDATE api_keys SET last_used_at = NOW() WHERE id = ?', [k.id]);
+    // Fire-and-forget: metering must never add latency to, or fail, an API call.
+    require('../services/usage').increment(k.tenant_id, 'api.requests.month', 1, {
+      source: 'api', referenceType: 'api_key', referenceId: k.id, requestId: req.requestId,
+      metadata: { method: req.method, path: req.originalUrl.slice(0, 200) },
+    }).catch((e) => console.error('[usage] api metering failed:', e.message));
+    // Surfaced so a client can watch its own consumption without polling.
+    res.setHeader('X-RateLimit-Limit', String(check.limit ?? 'unlimited'));
+    res.setHeader('X-RateLimit-Remaining', String(Math.max(0, (check.limit || 0) - (check.projected || 0))));
     next();
   } catch (e) { next(e); }
 }

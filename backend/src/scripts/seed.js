@@ -27,6 +27,7 @@ const { encrypt } = require('../utils/crypto');
 const {
   ROLE_DEFS, DEFAULT_ROLES, MODULE_CATALOG,
   SYSTEM_PERMISSION_GROUPS, SYSTEM_RELATIONSHIP_TYPES,
+  PLATFORM_ROLE_KEYS,
 } = require('../utils/permissions');
 const { ensureAdminUser, ADMIN_EMAIL, ADMIN_PASSWORD } = require('./lib/adminAccount');
 
@@ -627,7 +628,15 @@ async function seedAdministrationAccess(T, ctx) {
 }
 
 async function main() {
-  console.log('[seed] starting…');
+  // This script EMPTIES every table before loading demo data. It must never be one typo away from
+  // a production database, so it refuses unless the operator says out loud that it is intended.
+  const isProd = (process.env.NODE_ENV || 'development') === 'production';
+  if (isProd && process.env.ALLOW_DESTRUCTIVE_SEED !== 'yes-wipe-everything') {
+    console.error('[seed] REFUSED: NODE_ENV=production. This script deletes ALL data. '
+      + 'To really do this (e.g. a throwaway staging copy) set ALLOW_DESTRUCTIVE_SEED=yes-wipe-everything.');
+    process.exit(2);
+  }
+  console.log(`[seed] starting… (will wipe database "${process.env.DB_NAME || 'hrms'}")`);
   const hash = await bcrypt.hash(PASSWORD, 10);
 
   await pool.query('SET FOREIGN_KEY_CHECKS = 0');
@@ -655,7 +664,17 @@ async function main() {
     'master_data_items', 'master_data_categories', 'team_members', 'teams', 'positions', 'employee_relationships',
     'employee_relationship_types', 'permission_group_permissions', 'permission_groups', 'role_permission_groups',
     'role_permissions', 'user_roles', 'module_configurations', 'company_feature_flags', 'feature_flags',
-    'ip_restrictions', 'config_versions', 'workflow_versions', 'workflow_actions'];
+    'ip_restrictions', 'config_versions', 'workflow_versions', 'workflow_actions',
+    // Platform control plane. Entitlement/plan *definitions* are owned by the
+    // migration, so only per-tenant state is cleared here.
+    'subscription_events', 'subscriptions', 'usage_events', 'tenant_usage',
+    'tenant_entitlement_overrides', 'support_access_logs', 'support_access_sessions',
+    'platform_audit_logs', 'tenant_status_history', 'tenant_domains',
+    'data_export_requests', 'tenant_deletion_requests',
+    // commercial layer (per-tenant state only; addons/SLA/retention definitions are kept)
+    'subscription_payments', 'subscription_invoices', 'tenant_addons', 'payment_provider_events',
+    'support_ticket_notes', 'support_tickets', 'tenant_contacts', 'platform_notifications',
+    'maintenance_windows', 'platform_incident_updates', 'platform_incidents'];
   for (const t of TABLES) await pool.query(`DELETE FROM ${t}`);
   await pool.query('SET FOREIGN_KEY_CHECKS = 1');
 
@@ -1411,13 +1430,346 @@ async function main() {
     locations: [locBlr.insertId, locPune.insertId],
   });
 
+  await seedPlatformControlPlane(T, hash);
+
   console.log('[seed] done.');
   console.log(`  Administration console → http://localhost:5173/admin  (${ADMIN_EMAIL} | ${ADMIN_PASSWORD})`);
   console.log('  Logins (password: Password@123):');
   console.log('   super@arthvex.com | owner@arthvex.com | hr@arthvex.com | payroll@arthvex.com | finance@arthvex.com');
   console.log('   manager@arthvex.com | depthead@arthvex.com | recruiter@arthvex.com');
   console.log('   employee@arthvex.com (Diya Patel) | auditor@arthvex.com');
+  console.log('  Platform console logins (password: Platform@123):');
+  console.log('   super@platform.arthvex.com | billing@platform.arthvex.com');
+  console.log('   support@platform.arthvex.com | security@platform.arthvex.com | auditor@platform.arthvex.com');
+  console.log('  Customer company logins (password: Password@123):');
+  console.log('   planthead@demomfg.com (Growth, active) | owner@demostartup.com (Trial, trialing)');
   await pool.end();
+}
+
+/**
+ * The platform layer above the first company (spec §45).
+ *
+ * A control plane with one customer on it teaches nothing: every screen that
+ * matters — limit breaches, past-due recovery, plan comparison, support access —
+ * is empty. This seeds the shape a real platform has:
+ *
+ *   Arthvex Technologies    Enterprise  active      fully loaded, the "reference" customer
+ *   Demo Manufacturing     Growth      active      mid-size, travelling, integration-light
+ *   Demo Startup           Trial       trialing    capped hard, so the limit screens have content
+ *
+ * The platform staff accounts are deliberately four *separate* roles. That is the
+ * point of the whole exercise: a billing administrator must be able to work
+ * without any route to a customer's payroll.
+ */
+async function seedPlatformControlPlane(arthvexTenantId, hash) {
+  const platformHash = await bcrypt.hash('Platform@123', 10);
+
+  // ---------- Platform role rows (tenant_id NULL) ----------
+  // Normally owned by the migration; recreated here so `npm run db:seed` on its own
+  // still produces platform operators who resolve real permissions rather than
+  // falling back to nothing.
+  for (const key of PLATFORM_ROLE_KEYS) {
+    const def = ROLE_DEFS[key];
+    await pool.query(
+      `INSERT INTO roles (tenant_id, name, code, label, description, permissions, is_system, is_protected, role_type, status)
+       VALUES (NULL,?,?,?,?,?,1,1,'platform','active')
+       ON DUPLICATE KEY UPDATE label = VALUES(label), permissions = VALUES(permissions)`,
+      [key, key, def.label, 'ARTHVEX platform role', JSON.stringify(def.permissions)]
+    );
+  }
+
+  // ---------- ARTHVEX staff (tenant_id NULL = platform layer) ----------
+  const platformStaff = [
+    ['super@platform.arthvex.com', 'Platform Super Admin', 'platform_super_admin'],
+    ['billing@platform.arthvex.com', 'Platform Billing Admin', 'platform_billing_admin'],
+    ['support@platform.arthvex.com', 'Platform Support Admin', 'platform_support_admin'],
+    ['security@platform.arthvex.com', 'Platform Security Admin', 'platform_security_admin'],
+    ['auditor@platform.arthvex.com', 'Platform Auditor', 'platform_auditor'],
+  ];
+  const staffIds = {};
+  for (const [email, name, role] of platformStaff) {
+    await pool.query(
+      `INSERT INTO users (tenant_id, employee_id, email, password_hash, name, role, status)
+       VALUES (NULL, NULL, ?, ?, ?, ?, 'active')
+       ON DUPLICATE KEY UPDATE password_hash = VALUES(password_hash), role = VALUES(role), name = VALUES(name)`,
+      [email, platformHash, name, role]
+    );
+    const [[row]] = await pool.query('SELECT id FROM users WHERE email = ?', [email]);
+    staffIds[role] = row.id;
+    const [[roleRow]] = await pool.query('SELECT id FROM roles WHERE name = ? AND tenant_id IS NULL', [role]);
+    if (roleRow) {
+      await pool.query(
+        'INSERT IGNORE INTO user_roles (tenant_id, user_id, role_id, is_primary) VALUES (NULL, ?, ?, 1)',
+        [row.id, roleRow.id]
+      );
+    }
+  }
+
+  // ---------- Subscription for the reference company ----------
+  // Its entitlements resolve from the Enterprise plan; the tighter
+  // tenants.employee_limit it always had is preserved as a tenant override so the
+  // migration story ("existing data keeps the limit it had") is visible in the UI.
+  await createSubscription(arthvexTenantId, 'enterprise', { status: 'active', actor: staffIds.platform_super_admin });
+
+  // ---------- Two more customers, each in a different commercial state ----------
+  await seedCustomerCompany({
+    name: 'Demo Manufacturing Pvt Ltd',
+    slug: 'demo-manufacturing',
+    displayName: 'Demo Manufacturing',
+    planKey: 'growth',
+    tenantStatus: 'active',
+    subscriptionStatus: 'active',
+    industry: 'Manufacturing',
+    legalName: 'Demo Manufacturing Private Limited',
+    cin: 'U24219KA2021PTC148820',
+    pan: 'AAECD4521P',
+    gstin: '29AAECD4521P1ZR',
+    entityName: 'Demo Manufacturing — Unit 1',
+    pfCode: 'KABPL1234567000',
+    esiCode: '53000123450001000',
+    locations: [['Pune Works', 'PNW', 'Pune', 'Maharashtra'], ['Chennai Depot', 'CDE', 'Chennai', 'Tamil Nadu']],
+    departments: ['Operations', 'Quality', 'Supply Chain', 'Human Resources', 'Finance'],
+    // Two legal entities under one customer — a tenant is not a legal entity (spec §6).
+    extraEntities: [['Demo Manufacturing Services LLP', 'U24219KA2023PTC190455', 'AAECD4521Q', '29AAECD4521Q1ZQ']],
+    people: [
+      ['Ramesh', 'Kulkarni', 'Operations', 'Plant Head', 'planthead@demomfg.com', 'company_owner', 3600000],
+      ['Sunita', 'Deshpande', 'Human Resources', 'HR Manager', 'hr@demomfg.com', 'hr_admin', 1500000],
+      ['Imran', 'Shaikh', 'Quality', 'Quality Manager', 'quality@demomfg.com', 'manager', 1800000],
+      ['Neha', 'Rao', 'Supply Chain', 'Procurement Lead', 'procurement@demomfg.com', 'employee', 1200000],
+      ['Vikas', 'Chauhan', 'Finance', 'Accountant', 'accounts@demomfg.com', 'finance_admin', 1100000],
+      ['Anita', 'Yadav', 'Operations', 'Line Supervisor', 'anita.yadav@demomfg.com', 'employee', 720000],
+      ['Tarun', 'Bhatt', 'Operations', 'Maintenance Engineer', 'tarun.bhatt@demomfg.com', 'employee', 840000],
+      ['Kavya', 'Nair', 'Human Resources', 'HR Executive', 'kavya.nair@demomfg.com', 'employee', 640000],
+      ['Dev', 'Malhotra', 'Quality', 'Process Engineer', 'dev.malhotra@demomfg.com', 'employee', 960000],
+      ['Pooja', 'Iyer', 'Finance', 'Accounts Executive', 'pooja.iyer@demomfg.com', 'employee', 620000],
+    ],
+    modulesOff: ['travel', 'integrations', 'ai_assistant', 'compensation', 'benefits'],
+    usage: { 'storage.max_gb': 4.2, 'api.requests.month': 18300, 'workflow.executions.month': 2140 },
+  }, hash);
+
+  await seedCustomerCompany({
+    name: 'Demo Startup Pvt Ltd',
+    slug: 'demo-startup',
+    displayName: 'Demo Startup',
+    planKey: 'trial',
+    tenantStatus: 'trial',
+    subscriptionStatus: 'trialing',
+    industry: 'Software',
+    legalName: 'Demo Startup Private Limited',
+    pan: 'AAGCD7788R',
+    gstin: '27AAGCD7788R1Z3',
+    entityName: 'Demo Startup',
+    locations: [['Bengaluru Studio', 'BLR2', 'Bengaluru', 'Karnataka']],
+    departments: ['Engineering', 'Founders'],
+    people: [
+      ['Aditi', 'Rao', 'Founders', 'Founder & CEO', 'owner@demostartup.com', 'company_owner', 2400000],
+      ['Manish', 'Gupta', 'Engineering', 'CTO', 'cto@demostartup.com', 'manager', 2100000],
+      ['Zoya', 'Ahmed', 'Engineering', 'Full-stack Engineer', 'zoya@demostartup.com', 'employee', 1200000],
+    ],
+    // A trial that has switched on everything it can see is the fastest way to hit
+    // a cap, which is exactly what the limit screens need to demonstrate.
+    modulesOff: ['travel', 'ai_assistant', 'integrations', 'payroll', 'compensation', 'benefits'],
+    usage: { 'storage.max_gb': 0.7, 'api.requests.month': 420, 'workflow.executions.month': 64 },
+  }, hash);
+
+  // ---------- A tenant whose employee count is deliberately over its cap ----------
+  // This is what makes the "limit breach" panels real rather than theoretical.
+  const [[startup]] = await pool.query("SELECT id FROM tenants WHERE slug = 'demo-startup'");
+  await pool.query(
+    `INSERT INTO employees (tenant_id, employee_code, first_name, last_name, email, joined_on, employment_type, status)
+     SELECT ?, CONCAT('EMP', LPAD(900 + n, 4, '0')), first_name, last_name, email, CURDATE(), 'full_time', 'active'
+     FROM (
+       SELECT 'Lakshmi' AS first_name, 'Pillai' AS last_name, CONCAT('laksha', n, '@demostartup.com') AS email, n FROM
+       (SELECT 1 n UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8
+        UNION SELECT 9 UNION SELECT 10 UNION SELECT 11 UNION SELECT 12 UNION SELECT 13 UNION SELECT 14 UNION SELECT 15
+        UNION SELECT 16 UNION SELECT 17 UNION SELECT 18 UNION SELECT 19 UNION SELECT 20 UNION SELECT 21 UNION SELECT 22
+        UNION SELECT 23) t
+     ) x`,
+    [startup.id]
+  );
+
+  // ---------- One deliberately expired support-access session ----------
+  // So the console shows the full history — granted, what it looked at, expired —
+  // rather than an empty table. Nothing here grants access: `expires_at` is in the
+  // past, which is the point (spec §21).
+  const [[mfg]] = await pool.query("SELECT id FROM tenants WHERE slug = 'demo-manufacturing'");
+  const [sas] = await pool.query(
+    `INSERT INTO support_access_sessions (tenant_id, granted_by, granted_by_name, reason, ticket_ref, access_type, status, expires_at, revoked_at, created_at)
+     VALUES (?,?,?,?,?,?, 'expired', DATE_SUB(NOW(), INTERVAL 2 HOUR), NULL, DATE_SUB(NOW(), INTERVAL 3 HOUR))`,
+    [mfg.id, staffIds.platform_support_admin, 'Platform Support Admin',
+      'Payroll statutory configuration was rejecting the PF wage ceiling', 'SUP-1042', 'configuration']
+  );
+  for (const action of ['GET /administration/security/policies', 'GET /payroll/statutory', 'PUT /administration/modules/payroll']) {
+    await pool.query(
+      `INSERT INTO support_access_logs (session_id, tenant_id, actor_user_id, action, method, path)
+       VALUES (?,?,?,?,?,?)`,
+      [sas.insertId, mfg.id, staffIds.platform_support_admin, action, action.split(' ')[0], action.split(' ')[1]]
+    );
+  }
+
+  // ---------- Platform audit: what ARTHVEX has actually done so far ----------
+  const auditRows = [
+    [arthvexTenantId, staffIds.platform_super_admin, 'Platform Super Admin', 'tenant.provisioned', 'tenant', arthvexTenantId,
+      JSON.stringify({ plan: 'enterprise', modules: 'all' }), 'Initial provisioning', 'Provisioned during implementation'],
+    [mfg.id, staffIds.platform_billing_admin, 'Platform Billing Admin', 'subscription.create', 'subscription', mfg.id,
+      JSON.stringify({ plan: 'growth', status: 'active' }), 'Contract signed for 250 employees', 'Contract DEMO-2026-114'],
+    [startup.id, staffIds.platform_billing_admin, 'Platform Billing Admin', 'subscription.create', 'subscription', startup.id,
+      JSON.stringify({ plan: 'trial', status: 'trialing' }), '14-day evaluation started', 'Trial signup'],
+    [startup.id, staffIds.platform_super_admin, 'Platform Super Admin', 'entitlement.override_create', 'entitlement', null,
+      JSON.stringify({ entitlementKey: 'employees.max', value: '25' }), 'Trial headcount agreed at 25 seats', 'Trial terms'],
+  ];
+  for (const row of auditRows) {
+    await pool.query(
+      `INSERT INTO platform_audit_logs (tenant_id, actor_user_id, actor_name, action, category, entity_type, entity_id, before_json, after_json, reason, ip, user_agent)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [row[0], row[1], row[2], row[3], row[3].split('.')[0], row[4], row[5], null, row[6], row[7], '203.0.113.10', 'Arthvex provisioning console']
+    );
+  }
+
+  // ---------- Usage counters, derived from the rows that actually exist ----------
+  const usageService = require('../services/usage');
+  const [tenants] = await pool.query('SELECT id FROM tenants');
+  for (const row of tenants) await usageService.recompute(row.id, { source: 'seed' });
+
+  require('../services/entitlements').invalidateAll();
+  require('../services/rbac').invalidateAll();
+  console.log(`[seed] platform control plane seeded (${PLATFORM_ROLE_KEYS.length} platform roles, 5 platform logins, 3 customers, 1 expired support session, platform audit history).`);
+}
+
+/** Create the subscription row + its first event for a tenant. */
+async function createSubscription(tenantId, planKey, { status, actor }) {
+  const [[plan]] = await pool.query('SELECT * FROM platform_plans WHERE plan_key = ?', [planKey]);
+  const [ins] = await pool.query(
+    `INSERT INTO subscriptions (tenant_id, plan_id, plan_key, status, billing_cycle, quantity, price_per_period,
+        trial_ends_at, current_period_start, current_period_end, created_by)
+     VALUES (?,?,?,?, 'monthly', 0, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL 1 MONTH), ?)`,
+    [tenantId, plan.id, plan.plan_key, status, plan.price_monthly,
+      status === 'trialing' && plan.trial_days ? new Date(Date.now() + plan.trial_days * 86400000) : null, actor || null]
+  );
+  await pool.query(
+    `INSERT INTO subscription_events (subscription_id, tenant_id, event_type, to_status, reason, actor_user_id)
+     VALUES (?,?,?,?,?,?)`,
+    [ins.insertId, tenantId, status === 'trialing' ? 'trial_started' : 'activated', status, 'Seeded demo subscription', actor || null]
+  );
+  return ins.insertId;
+}
+
+/**
+ * A believable customer company: profile, legal entities, locations, departments,
+ * people with logins, module configuration and a subscription.
+ */
+async function seedCustomerCompany(spec, hash) {
+  const j = (v) => JSON.stringify(v);
+  // The legacy employee_limit column is a mirror of the plan's employees.max grant,
+  // read from the catalogue rather than written out again here.
+  const planDef = require('../utils/permissions').PLATFORM_PLANS.find((p) => p.key === spec.planKey);
+  const employeeLimit = Number((planDef && planDef.entitlements['employees.max']) || 200);
+  const [tenant] = await pool.query(
+    `INSERT INTO tenants (name, display_name, slug, plan, status, industry, country, timezone, currency,
+        contact_email, contact_phone, branding, feature_flags, employee_limit, onboarded_at)
+     VALUES (?,?,?,?,?,?, 'IN', 'Asia/Kolkata', 'INR', ?,?,?, '{}', ?, NOW())`,
+    [spec.name, spec.displayName, spec.slug, spec.planKey, spec.tenantStatus, spec.industry || null,
+      spec.people[0][4], null,
+      j({ companyName: spec.displayName, primaryColor: '#0f766e', loginTagline: 'People first. Always.' }),
+      employeeLimit]
+  );
+  const T = tenant.insertId;
+
+  for (const key of DEFAULT_ROLES) {
+    await pool.query(
+      'INSERT INTO roles (tenant_id, name, label, permissions, is_system, is_protected, role_type, status) VALUES (?,?,?,?,1,1,\'system\',\'active\')',
+      [T, key, ROLE_DEFS[key].label, JSON.stringify(ROLE_DEFS[key].permissions)]
+    );
+  }
+
+  await pool.query(
+    `INSERT INTO companies (tenant_id, legal_name, trade_name, cin, pan, tan, gstin, address_line1, city, state, state_code, pincode, contact_email)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [T, spec.legalName, spec.displayName, spec.cin || null, spec.pan || null, null, spec.gstin || null,
+      'Registered office', spec.locations[0][2], spec.locations[0][3], null, null, spec.people[0][4]]
+  );
+
+  // A tenant may run several legal entities; payroll and statutory follow the
+  // entity, not the tenant (spec §6).
+  for (const [i, name] of [spec.entityName, ...(spec.extraEntities || []).map((e) => e[0])].entries()) {
+    const extra = (spec.extraEntities || [])[i - 1] || [];
+    await pool.query(
+      `INSERT INTO legal_entities (tenant_id, name, code, entity_type, cin, pan, gstin, city, state, pf_code, esi_code, is_primary, status)
+       VALUES (?,?,?, 'company', ?,?,?,?,?,?,?,?, 'active')`,
+      [T, name, name.slice(0, 10).toUpperCase().replace(/\s/g, ''), spec.cin || null,
+        extra[2] || spec.pan || null, extra[3] || spec.gstin || null,
+        spec.locations[0][2], spec.locations[0][3], spec.pfCode || null, spec.esiCode || null, i === 0 ? 1 : 0]
+    );
+  }
+
+  const locIds = {};
+  for (const [name, code, city, state] of spec.locations) {
+    const [ins] = await pool.query(
+      'INSERT INTO locations (tenant_id, name, code, city, state, address, status) VALUES (?,?,?,?,?,?, \'active\')',
+      [T, name, code, city, state, `${city} industrial area`]
+    );
+    locIds[code] = ins.insertId;
+  }
+  const firstLoc = locIds[spec.locations[0][1]];
+
+  const deptIds = {};
+  for (const d of spec.departments) {
+    const [ins] = await pool.query('INSERT INTO departments (tenant_id, name, code, status) VALUES (?,?,?,\'active\')', [T, d, d.slice(0, 3).toUpperCase()]);
+    deptIds[d] = ins.insertId;
+  }
+  const [grade] = await pool.query('INSERT INTO grades (tenant_id, name, level) VALUES (?,?,1)', [T, 'L3']);
+  const [desig] = await pool.query('INSERT INTO designations (tenant_id, name, code) VALUES (?,?,?)', [T, 'Specialist', 'SP']);
+  const [cc] = await pool.query('INSERT INTO cost_centers (tenant_id, name, code) VALUES (?,?,?)', [T, 'Operations', 'CC-OPS']);
+
+  const [roleRows] = await pool.query('SELECT id, name FROM roles WHERE tenant_id = ?', [T]);
+  const rid = (name) => (roleRows.find((r) => r.name === name) || {}).id;
+
+  let n = 100;
+  for (const [first, last, dept, title, email, role, ctc] of spec.people) {
+    n += 1;
+    const [emp] = await pool.query(
+      `INSERT INTO employees (tenant_id, employee_code, first_name, last_name, email, joined_on, employment_type, status,
+         department_id, designation_id, grade_id, location_id, cost_center_id, pan_plain, pan_enc)
+       VALUES (?,?,?,?,?,?, 'full_time','active', ?,?,?,?,?,?,?)`,
+      [T, `EMP${n}`, first, last, email, dayjs().subtract(120 + n * 11, 'day').format('YYYY-MM-DD'),
+        deptIds[dept] || null, desig.insertId, grade.insertId, firstLoc, cc.insertId,
+        `ABCDE${2000 + n}F`, encrypt(`ABCDE${2000 + n}F`)]
+    );
+    const [user] = await pool.query(
+      `INSERT INTO users (tenant_id, employee_id, email, password_hash, name, role, status, must_change_password)
+       VALUES (?,?,?,?,?,?, 'active', 0)`,
+      [T, emp.insertId, email, hash, `${first} ${last}`, role]
+    );
+    await pool.query(
+      'INSERT IGNORE INTO user_roles (tenant_id, user_id, role_id, is_primary) VALUES (?,?,?,1)',
+      [T, user.insertId, rid(role)]
+    );
+    await pool.query(
+      'INSERT INTO employee_timeline (tenant_id, employee_id, event_type, title, event_date, created_by) VALUES (?,?,\'joined\',?,?,1)',
+      [T, emp.insertId, `Joined as ${title}`, dayjs().subtract(120 + n * 11, 'day').format('YYYY-MM-DD')]
+    );
+  }
+
+  // Module state: everything the company has chosen to run. Whatever is off here is
+  // genuinely off — the API refuses it — which is what makes the Modules screen
+  // meaningful. The plan decides what may be turned *on* (entitlementService enforces
+  // that); this decides what has been turned on.
+  for (const m of MODULE_CATALOG) {
+    const on = !spec.modulesOff.includes(m.key);
+    await pool.query(
+      `INSERT INTO module_configurations (tenant_id, module_key, name, category, enabled, settings)
+       VALUES (?,?,?,?,?,?) ON DUPLICATE KEY UPDATE enabled = VALUES(enabled)`,
+      [T, m.key, m.name, m.category, on ? 1 : 0, j({ seeded: true })]
+    );
+  }
+
+  await createSubscription(T, spec.planKey, { status: spec.subscriptionStatus });
+  await pool.query(
+    `INSERT INTO tenant_status_history (tenant_id, from_status, to_status, reason, actor_name)
+     VALUES (?, 'provisioning', ?, ?, 'Seed data')`,
+    [T, spec.tenantStatus, 'Provisioned during the platform demo seed']
+  );
+  return T;
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });

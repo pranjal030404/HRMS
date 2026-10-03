@@ -99,7 +99,7 @@ r.get('/dashboard', DASH, asyncH(async (req, res) => {
 
 /** What this particular user may start doing right now. */
 function buildQuickActions(user) {
-  const can = (p) => user.isPlatformAdmin || (user.permissions || []).includes(p);
+  const can = (p) => user.isPlatformSuperAdmin || (user.permissions || []).includes(p);
   const actions = [];
   if (can('administration.users.invite')) actions.push({ key: 'invite_user', label: 'Invite a user', route: '/administration/users?action=invite' });
   if (can('administration.roles.manage')) actions.push({ key: 'create_role', label: 'Create a role', route: '/administration/roles?action=create' });
@@ -235,6 +235,14 @@ r.post('/bulk/:entity', BULK, asyncH(async (req, res) => {
     throw new HttpError(404, 'None of the selected records belong to this company');
   }
 
+  // Dry-run with nothing eligible: report the skips without invoking a handler that
+  // assumes a non-empty id list (it would build `IN ()`).
+  if (!ownedIds.length) {
+    return res.json({
+      data: { dryRun: true, target: 0, skipped, planned: 'Would change 0 record(s) — none of the selected records belong to this company' },
+    });
+  }
+
   const plan = await handler({ tenant: t, ids: ownedIds, value, actor: req.user });
   const describe = plan.describe || `set ${operation} to "${value}"`;
 
@@ -317,8 +325,8 @@ r.get('/data-sets', EXPORT, asyncH(async (req, res) => {
   res.json({
     data: Object.entries(DATA_SETS).map(([key, spec]) => ({
       key, columns: spec.columns, required: spec.required,
-      canImport: req.user.isPlatformAdmin || (req.user.permissions || []).includes(spec.write),
-      canExport: req.user.isPlatformAdmin || spec.read.some((p) => (req.user.permissions || []).includes(p)),
+      canImport: req.user.isPlatformSuperAdmin || (req.user.permissions || []).includes(spec.write),
+      canExport: req.user.isPlatformSuperAdmin || spec.read.some((p) => (req.user.permissions || []).includes(p)),
     })),
   });
 }));
@@ -329,11 +337,17 @@ r.get('/data-sets', EXPORT, asyncH(async (req, res) => {
  * `mode`: create | upsert. Every rejected row is returned with the reason, so a
  * partial import is never a mystery.
  */
-r.post('/import/:entity', IMPORT, asyncH(async (req, res) => {
+async function importData(req, res) {
   const t = writeTenantId(req);
   const spec = DATA_SETS[req.params.entity];
   if (!spec) throw new HttpError(404, `Unknown data set "${req.params.entity}"`);
   const { dry_run: dryRun = true, mode = 'create', csv, rows } = req.body || {};
+  // The route gate is the generic import permission; each data set names its own write
+  // permission, which previously was only displayed, never enforced.
+  const perms = req.user.permissions || [];
+  if (!dryRun && !req.user.isPlatformSuperAdmin && !perms.includes(spec.write) && !perms.includes('settings.manage')) {
+    throw new HttpError(403, `Missing permission: ${spec.write}`);
+  }
 
   let records = rows;
   if (!records && csv) records = parseCsv(csv);
@@ -366,6 +380,13 @@ r.post('/import/:entity', IMPORT, asyncH(async (req, res) => {
 
   const created = [];
   if (!dryRun && accepted.length) {
+    // Employees are a sold quantity: the whole batch is checked against the remaining
+    // headroom first, exactly as the CSV importer on /employees does.
+    if (req.params.entity === 'employees') {
+      await require('../../services/limits').assertWithinLimit({
+        tenantId: t, entitlementKey: 'employees.max', incoming: accepted.length, action: 'employee.import', req,
+      });
+    }
     for (const row of accepted) {
       try {
         const id = await spec.insert(t, row, req.user.id);
@@ -387,6 +408,12 @@ r.post('/import/:entity', IMPORT, asyncH(async (req, res) => {
       templateColumns: spec.columns,
     },
   });
+}
+// Writes are check-then-insert against a cap, so they run under the per-company lock.
+r.post('/import/:entity', IMPORT, asyncH((req, res) => {
+  const dry = req.body?.dry_run === undefined ? true : req.body.dry_run;
+  if (dry) return importData(req, res);
+  return require('../../services/limits').withTenantLock(writeTenantId(req), req.params.entity === 'employees' ? 'employee.create' : 'import', () => importData(req, res));
 }));
 
 /** GET /export/:entity — CSV download of a data set. */
@@ -447,7 +474,7 @@ r.get('/export/:entity', EXPORT, asyncH(async (req, res) => {
 
   const def = SELECTS[key];
   if (!def) throw new HttpError(404, `Nothing to export for "${key}"`);
-  if (def.permission && !req.user.isPlatformAdmin && !(req.user.permissions || []).includes(def.permission)) {
+  if (def.permission && !req.user.isPlatformSuperAdmin && !(req.user.permissions || []).includes(def.permission)) {
     throw new HttpError(403, `Missing permission: ${def.permission}`);
   }
   const params = def.extra ? [t, ...def.extra] : [t];
@@ -520,15 +547,69 @@ module.exports = r;
 
 const AUDIT_CSV_COLUMNS = ['created_at', 'actor_name', 'actor_role', 'actor_email', 'action', 'module', 'entity_type', 'entity_id', 'ip', 'request_id', 'outcome'];
 
-/** Streams the audit trail as CSV. Shared by `?format=csv` and /audit/export. */
+/** Rows pulled per round trip while streaming. */
+const AUDIT_CSV_PAGE = 500;
+
+/**
+ * Streams the audit trail as CSV. Shared by `?format=csv` and /audit/export.
+ *
+ * Streamed rather than buffered with a LIMIT: an audit trail is the one table that
+ * grows without bound, and a hard cap silently returns a CSV that looks complete
+ * while quietly missing every row past it — the worst possible failure for evidence
+ * someone may need to rely on. Keyset pagination on `id` is used instead of OFFSET,
+ * so the page size does not degrade as the table grows and rows written *during* the
+ * download do not shift the window under the cursor. `id` is a monotonic
+ * auto-increment, so it orders consistently with `created_at`.
+ */
 async function sendAuditCsv(req, res, base, params) {
-  const [rows] = await pool.query(
-    `SELECT ${AUDIT_CSV_COLUMNS.join(', ')} ${base} ORDER BY created_at DESC LIMIT 10000`, params
-  );
-  await audit(req, { action: 'audit.export', entityType: 'audit', after: { rows: rows.length } });
-  res.setHeader('Content-Type', 'text/csv');
+  const defs = AUDIT_CSV_COLUMNS.map((c) => ({ key: c, header: c.toUpperCase() }));
+  let rows = 0;
+  // Newest first, matching the on-screen list. Seeded above any real id so the
+  // first page needs no special-casing.
+  let lastId = Number.MAX_SAFE_INTEGER;
+  let aborted = false;
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename=audit-${dayjs().format('YYYYMMDD')}.csv`);
-  return res.send(toCsv(rows, AUDIT_CSV_COLUMNS.map((c) => ({ key: c, header: c.toUpperCase() }))));
+  // Stop the whole export being cached by an intermediary holding customer audit data.
+  res.setHeader('Cache-Control', 'no-store');
+
+  const write = async (chunk) => {
+    // Respect backpressure: dumping megabytes into the socket buffer is how an
+    // export endpoint takes down the API process it shares memory with.
+    if (!res.write(chunk)) await new Promise((resolve) => res.once('drain', resolve));
+  };
+
+  const onClose = () => { aborted = true; };
+  res.on('close', onClose);
+  try {
+    await write(`${toCsv([], defs)}\n`);
+
+    for (;;) {
+      const [page] = await pool.query(
+        `SELECT id, ${AUDIT_CSV_COLUMNS.join(', ')} ${base} AND id < ?
+          ORDER BY id DESC LIMIT ${AUDIT_CSV_PAGE}`,
+        [...params, lastId]
+      );
+      if (!page.length) break;
+
+      lastId = Number(page[page.length - 1].id);
+      // Strip the keyset column so it does not leak into the CSV, and terminate the
+      // page — `toCsv` emits no trailing newline, so without this the last row of one
+      // page and the first row of the next would fuse into a single corrupt line.
+      await write(`${toCsv(page.map(({ id, ...r }) => r), defs, { header: false })}\n`);
+      rows += page.length;
+
+      // The operator closed the tab or cancelled; stop querying.
+      if (aborted || res.destroyed || req.aborted) break;
+      if (page.length < AUDIT_CSV_PAGE) break;
+    }
+
+    await audit(req, { action: 'audit.export', entityType: 'audit', after: { rows, truncated: false } });
+    if (!aborted && !res.destroyed) res.end();
+  } finally {
+    res.off('close', onClose);
+  }
 }
 
 /**

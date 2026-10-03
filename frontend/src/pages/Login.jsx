@@ -117,9 +117,12 @@ export default function Login() {
               </button>
             </>
           )}
-          <p style={{ fontSize: 12, color: 'var(--muted)', textAlign: 'center', marginTop: 18 }}>
-            Demo: hr@arthvex.com · employee@arthvex.com<br />Password: Password@123
-          </p>
+          {/* Seeded demo logins exist only in a development build; a production bundle never ships them. */}
+          {import.meta.env.DEV && (
+            <p style={{ fontSize: 12, color: 'var(--muted)', textAlign: 'center', marginTop: 18 }}>
+              Demo: hr@arthvex.com · employee@arthvex.com<br />Password: Password@123
+            </p>
+          )}
           <p style={{ fontSize: 12, color: 'var(--muted)', textAlign: 'center', marginTop: 10 }}>
             <Link to="/admin" style={{ color: 'var(--primary)' }}>Administrator? Sign in to the console →</Link>
           </p>

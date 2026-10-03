@@ -19,15 +19,54 @@ r.get('/:subdir/:file', authenticate, asyncH(async (req, res) => {
   if (!fs.existsSync(filePath)) throw new HttpError(404, 'File not found');
 
   const perms = req.user.permissions || [];
-  const isPlatform = req.user.role === 'platform_super_admin';
-  const t = req.user.tenant_id;
+  const isPlatform = !!req.user.isPlatformAdmin;
+  const rel = `${subdir}/${file}`;
 
-  // resolve tenant ownership of the file
+  // Which company owns this file? The referencing row is the only record, so the
+  // answer comes from the database and never from the request (spec §24: file
+  // access respects tenant boundaries). A valid role is not enough — Company A's
+  // owner holding `document.manage` must not be able to open Company B's upload.
+  const OWNER_SQL = {
+    payslips: ['SELECT tenant_id FROM payslips WHERE pdf_path = ?'],
+    letters: ['SELECT tenant_id FROM generated_letters WHERE pdf_path = ?'],
+    invoices: ['SELECT tenant_id FROM invoices WHERE pdf_path = ?'],
+    documents: [
+      'SELECT tenant_id FROM company_documents WHERE file_path = ?',
+      'SELECT tenant_id FROM employee_documents WHERE file_path = ?',
+    ],
+    receipts: ['SELECT tenant_id FROM expense_claims WHERE receipt_path = ?'],
+    resumes: ['SELECT tenant_id FROM candidates WHERE resume_path = ?'],
+    // Previously served to any signed-in user. Ownership is now proved from the row that
+    // references the file; an unreferenced photo/logo/announcement is not served.
+    photos: ['SELECT tenant_id FROM employees WHERE profile_photo = ?'],
+    logos: ["SELECT id AS tenant_id FROM tenants WHERE JSON_UNQUOTE(JSON_EXTRACT(branding, '$.logoUrl')) LIKE CONCAT('%', ?)"],
+    announcements: [],
+  };
+  let ownerTenant = null;
+  for (const sql of OWNER_SQL[subdir] || []) {
+    const [rows] = await pool.query(`${sql} LIMIT 1`, [rel]);
+    if (rows[0]) { ownerTenant = Number(rows[0].tenant_id); break; }
+  }
+  {
+    if (!OWNER_SQL[subdir]) throw new HttpError(403, 'Not allowed');
+    // An unreferenced file belongs to nobody we can prove; do not serve it.
+    if (ownerTenant === null) throw new HttpError(404, 'File not found');
+    if (Number(req.user.tenant_id) !== ownerTenant) {
+      if (!isPlatform) throw new HttpError(404, 'File not found');
+      // Platform staff reach another company's files only inside a support session.
+      const reach = await require('../services/supportAccess').assertTenantReach(req.user, ownerTenant);
+      require('../services/supportAccess').logAction(reach.session, {
+        userId: req.user.id, action: 'GET file', method: 'GET', path: req.originalUrl, req,
+      });
+      return sendIt();
+    }
+  }
+
   let owns = false;
   switch (subdir) {
     case 'payslips': {
       if (perms.includes('payroll.view')) { owns = true; break; }
-      const [rows] = await pool.query('SELECT employee_id FROM payslips WHERE pdf_path = ? AND tenant_id = ?', [`${subdir}/${file}`, t]);
+      const [rows] = await pool.query('SELECT employee_id FROM payslips WHERE pdf_path = ? AND tenant_id = ?', [rel, req.user.tenant_id]);
       owns = !!rows[0] && Number(rows[0].employee_id) === Number(req.user.employee_id);
       break;
     }
@@ -48,19 +87,19 @@ r.get('/:subdir/:file', authenticate, asyncH(async (req, res) => {
       break;
     case 'photos':
     case 'logos':
-    case 'announcements':
-      owns = true;
+      owns = true; // tenant ownership was already proved above
       break;
     default:
       throw new HttpError(403, 'Not allowed');
   }
-  if (isPlatform || owns) {
+  if (!owns) throw new HttpError(403, 'Not allowed to access this file');
+  return sendIt();
+
+  function sendIt() {
     res.setHeader('Content-Type', guessMime(file));
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Content-Disposition', `inline; filename="${path.basename(file)}"`);
     res.sendFile(filePath);
-  } else {
-    throw new HttpError(403, 'Not allowed to access this file');
   }
 }));
 

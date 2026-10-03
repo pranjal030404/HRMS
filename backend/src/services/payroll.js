@@ -10,6 +10,21 @@ const { generatePayslipPdf } = require('./pdf');
 
 const CALC_STATUSES = ['draft', 'calculated'];
 
+/**
+ * Calendar days in the month during which the person was not employed: before the joining
+ * date and after the exit date. Without this a mid-month joiner or leaver was paid the whole
+ * month. Scaled to the run's `month_days` so a fixed 30-day payroll month stays consistent.
+ */
+function daysOutsideEmployment({ joinedOn, exitDate, monthStart, monthEnd, daysInMonth, monthDays }) {
+  const day = (d) => new Date(`${String(d).slice(0, 10)}T00:00:00Z`).getTime();
+  const lo = day(monthStart); const hi = day(monthEnd);
+  let outside = 0;
+  if (joinedOn && day(joinedOn) > lo) outside += Math.round((Math.min(day(joinedOn), hi + 86400000) - lo) / 86400000);
+  if (exitDate && day(exitDate) < hi) outside += Math.round((hi - Math.max(day(exitDate), lo - 86400000)) / 86400000);
+  outside = Math.min(outside, daysInMonth);
+  return round2((outside * monthDays) / daysInMonth);
+}
+
 /** Resolve employee salary items effective for a given month-end. */
 async function getEffectiveSalary(tenantId, employeeId, onDate) {
   const [rows] = await pool.query(
@@ -102,7 +117,10 @@ async function calculateRun(tenantId, runId, actor) {
     const itemsArr = Array.isArray(salary.items) ? salary.items : JSON.parse(salary.items || '[]');
 
     const lopDays = await lopForMonth(tenantId, emp.id, run.period_year, run.period_month);
-    const payableDays = Math.max(0, monthDays - lopDays);
+    const outsideDays = daysOutsideEmployment({
+      joinedOn: emp.joined_on, exitDate: emp.exit_date, monthStart, monthEnd, daysInMonth, monthDays,
+    });
+    const payableDays = Math.max(0, round2(monthDays - lopDays - outsideDays));
 
     // overtime minutes in month
     const [otRows] = await pool.query(
@@ -526,4 +544,4 @@ async function createAdjustment(tenantId, actor, {
   return { id: ins.insertId, status, appliedRunId: null, reused: false };
 }
 
-module.exports = { calculateRun, transitionRun, bankFile, getEffectiveSalary, createAdjustment };
+module.exports = { daysOutsideEmployment, calculateRun, transitionRun, bankFile, getEffectiveSalary, createAdjustment };

@@ -108,10 +108,24 @@ const PERMISSIONS = [
   'administration.access_requests.view', 'administration.access_requests.manage',
   'administration.access_preview.view', 'administration.access_debug.view',
   // ---------- Platform (above tenant) ----------
+  // The platform namespace is deliberately separate from the tenant HRMS
+  // namespace. Holding any of these says nothing about a company's HR data: the
+  // only way a platform operator reads tenant records is Support Access.
+  'platform.dashboard.view',
   'platform.tenants.view', 'platform.tenants.manage', 'platform.tenants.delete',
-  'platform.tenants.impersonate', 'platform.plans.manage',
+  'platform.tenants.impersonate',
+  'platform.plans.view', 'platform.plans.manage',
+  'platform.entitlements.view', 'platform.entitlements.manage',
+  'platform.subscriptions.view', 'platform.subscriptions.manage',
+  'platform.usage.view', 'platform.usage.manage',
+  'platform.support.view', 'platform.support.grant', 'platform.support.revoke',
+  'platform.security.view', 'platform.security.manage',
+  'platform.data.view', 'platform.data.export', 'platform.data.delete',
   'platform.feature_flags.manage', 'platform.settings.manage',
-  'platform.audit.view', 'platform.stats.view', 'platform.integrations.manage',
+  'platform.audit.view', 'platform.audit.export', 'platform.stats.view',
+  'platform.integrations.view', 'platform.integrations.manage',
+  'platform.users.view', 'platform.users.manage',
+  'platform.config.view', 'platform.config.manage',
 ];
 
 /**
@@ -324,11 +338,74 @@ function hasPerm(perms, perm) {
   return aliasCandidates(perm).some((a) => list.includes(a) || list.some((p) => p.startsWith(a + ':')));
 }
 
+/** Every `platform.*` key — the whole control-plane surface, as data. */
+const PLATFORM_PERMISSIONS = PERMISSIONS.filter((p) => p.startsWith('platform.'));
+
+/**
+ * Platform roles (spec §3).
+ *
+ * These are ARTHVEX staff, not customers. Each is a narrow operator: billing owns
+ * money, support owns incidents, security owns posture, the auditor owns nothing
+ * but read access. None of them is granted tenant HRMS permissions here — the way
+ * a platform operator reaches a customer's records is Support Access, not a
+ * standing grant (spec §2, §21).
+ */
 const ROLE_DEFS = {
   platform_super_admin: {
     label: 'Platform Super Admin',
     tenantScoped: false,
-    permissions: PERMISSIONS.filter((p) => p !== 'dashboard.view'),
+    roleType: 'platform',
+    // The control plane, in full. Tenant data is reached through Support Access.
+    permissions: PLATFORM_PERMISSIONS,
+  },
+  platform_billing_admin: {
+    label: 'Platform Billing Admin',
+    tenantScoped: false,
+    roleType: 'platform',
+    permissions: PLATFORM_PERMISSIONS.filter((p) => [
+      'platform.dashboard.view', 'platform.stats.view',
+      'platform.plans.view', 'platform.plans.manage',
+      'platform.entitlements.view',
+      'platform.subscriptions.view', 'platform.subscriptions.manage',
+      'platform.usage.view',
+      'platform.tenants.view',
+      'platform.audit.view',
+    ].includes(p)),
+  },
+  platform_support_admin: {
+    label: 'Platform Support Admin',
+    tenantScoped: false,
+    roleType: 'platform',
+    permissions: PLATFORM_PERMISSIONS.filter((p) => [
+      'platform.dashboard.view', 'platform.stats.view',
+      'platform.tenants.view',
+      'platform.support.view', 'platform.support.grant', 'platform.support.revoke',
+      'platform.usage.view',
+      'platform.integrations.view',
+      'platform.security.view',
+      'platform.audit.view',
+    ].includes(p)),
+  },
+  platform_security_admin: {
+    label: 'Platform Security Admin',
+    tenantScoped: false,
+    roleType: 'platform',
+    permissions: PLATFORM_PERMISSIONS.filter((p) => [
+      'platform.dashboard.view', 'platform.stats.view',
+      'platform.tenants.view',
+      'platform.security.view', 'platform.security.manage',
+      'platform.users.view',
+      'platform.support.view',
+      'platform.audit.view', 'platform.audit.export',
+      'platform.integrations.view',
+    ].includes(p)),
+  },
+  platform_auditor: {
+    label: 'Platform Auditor (Read Only)',
+    tenantScoped: false,
+    roleType: 'platform',
+    // Every platform read, no writes at all.
+    permissions: PLATFORM_PERMISSIONS.filter((p) => /\.(view|export)$/.test(p)),
   },
   company_owner: {
     label: 'Company Owner',
@@ -635,6 +712,40 @@ const MODULE_PERMISSION_MODULES = {
   ai_assistant: ['ai'],
 };
 
+/**
+ * Module dependencies (spec §16).
+ *
+ * A module cannot be enabled when a module it requires is unavailable — turning
+ * Payroll on without Payroll's statutory/legal-entity prerequisites would produce
+ * a payroll run that cannot be correct. Kept as data so the provisioning wizard,
+ * the plan editor and the module screen all explain the same graph.
+ */
+const MODULE_DEPENDENCIES = {
+  payroll: ['employees', 'leave', 'attendance'],
+  compensation: ['employees', 'payroll'],
+  benefits: ['employees', 'payroll'],
+  performance: ['employees'],
+  recruitment: ['employees'],
+  talent: ['employees'],
+  engagement: ['employees'],
+  employee_relations: ['employees'],
+  workflow: ['employees'],
+  timesheets: ['employees'],
+  travel: ['employees', 'expenses'],
+  loans: ['employees', 'payroll'],
+  lifecycle: ['employees'],
+  workforce_planning: ['employees'],
+  analytics: ['employees'],
+  documents: ['employees'],
+  assets: ['employees'],
+  integrations: ['employees'],
+  ai_assistant: ['employees'],
+  learning: ['employees'],
+};
+
+/** Hard dependencies of a module, after removing self-referential placeholders. */
+const moduleDependencies = (moduleKey) => (MODULE_DEPENDENCIES[moduleKey] || []).filter((k) => k && k !== moduleKey);
+
 /** Reusable reporting-relationship types. `primary` mirrors the classic manager_id slot. */
 const SYSTEM_RELATIONSHIP_TYPES = [
   { code: 'reporting_manager', name: 'Reporting Manager', description: 'Solid-line manager responsible for the employee.', isPrimary: true, sortOrder: 10 },
@@ -663,11 +774,236 @@ const DEFAULT_SECURITY_POLICIES = {
   'audit.retention_days': { __desc: 'Audit log retention in days (0 = forever)', value: 0 },
 };
 
-const PLATFORM_PLANS = [
-  { key: 'trial', name: 'Trial', description: 'Evaluation access with core HR modules.', priceMonthly: 0, employeeLimit: 25, modules: ['employees', 'attendance', 'leave', 'documents'], sortOrder: 10 },
-  { key: 'standard', name: 'Standard', description: 'Full people operations for small teams.', priceMonthly: 4999, employeeLimit: 100, modules: null, sortOrder: 20 },
-  { key: 'enterprise', name: 'Enterprise', description: 'Unlimited modules, integrations and SSO.', priceMonthly: 14999, employeeLimit: 500, modules: null, sortOrder: 30 },
+/**
+ * The entitlement catalogue (spec §8).
+ *
+ * This is the *shape* of what a plan can grant. It is seeded into the
+ * `entitlements` table so plans, overrides, usage and limits all read one
+ * registry instead of hard-coded numbers. Three kinds:
+ *
+ *   boolean — a feature switch   (`payroll.enabled`)
+ *   numeric — an absolute cap    (`employees.max`)
+ *   metered — a cap that resets  (`api.requests.month`)
+ */
+const ENTITLEMENT_CATALOG = [
+  // ---- capacity (numeric) ----
+  { key: 'employees.max', name: 'Employees', description: 'Employee records on the tenant’s payroll.', kind: 'numeric', unit: 'employees', warningPct: 80, criticalPct: 90 },
+  { key: 'active_users.max', name: 'Active login users', description: 'Accounts that can sign in.', kind: 'numeric', unit: 'users' },
+  { key: 'admins.max', name: 'Administrative users', description: 'Users holding an administrative role inside the tenant.', kind: 'numeric', unit: 'admins' },
+  { key: 'locations.max', name: 'Work locations', description: 'Distinct places employees work from.', kind: 'numeric', unit: 'locations' },
+  { key: 'legal_entities.max', name: 'Legal entities', description: 'Statutory registration units (PAN/GSTIN/PF/ESI).', kind: 'numeric', moduleKey: 'payroll', unit: 'entities' },
+  { key: 'storage.max_gb', name: 'Document storage', description: 'Space used by the document vault and generated files.', kind: 'numeric', unit: 'GB' },
+  { key: 'api_keys.max', name: 'API keys', description: 'Service credentials issued against the public API.', kind: 'numeric', moduleKey: 'integrations', unit: 'keys' },
+  { key: 'webhooks.max', name: 'Webhooks', description: 'Outbound event subscriptions.', kind: 'numeric', moduleKey: 'integrations', unit: 'webhooks' },
+  { key: 'recruitment.jobs.max', name: 'Open requisitions', description: 'Requisitions that may be open at once.', kind: 'numeric', moduleKey: 'recruitment', unit: 'jobs' },
+
+  // ---- consumption (metered, period resets) ----
+  { key: 'api.requests.month', name: 'API requests per month', description: 'Requests to the versioned public API.', kind: 'metered', period: 'month', moduleKey: 'integrations', unit: 'requests' },
+  { key: 'workflow.executions.month', name: 'Workflow executions per month', description: 'Approval workflow runs started.', kind: 'metered', period: 'month', moduleKey: 'workflow', unit: 'runs' },
+  { key: 'payroll_runs.month', name: 'Payroll runs per month', description: 'Payroll runs calculated in a calendar month.', kind: 'metered', period: 'month', moduleKey: 'payroll', unit: 'runs' },
+  { key: 'ai.requests.month', name: 'AI assistant questions per month', description: 'Natural-language questions asked of the assistant.', kind: 'metered', period: 'month', moduleKey: 'ai_assistant', unit: 'questions' },
+  { key: 'documents.stored', name: 'Stored documents', description: 'Files retained in the document vault.', kind: 'numeric', moduleKey: 'documents', unit: 'files' },
+
+  // ---- module availability (boolean) ----
+  { key: 'employees.enabled', name: 'Employees module', kind: 'boolean', moduleKey: 'employees', defaultValue: '1' },
+  { key: 'attendance.enabled', name: 'Attendance module', kind: 'boolean', moduleKey: 'attendance', defaultValue: '1' },
+  { key: 'leave.enabled', name: 'Leave module', kind: 'boolean', moduleKey: 'leave', defaultValue: '1' },
+  { key: 'timesheets.enabled', name: 'Timesheets module', kind: 'boolean', moduleKey: 'timesheets' },
+  { key: 'payroll.enabled', name: 'Payroll module', kind: 'boolean', moduleKey: 'payroll' },
+  { key: 'compensation.enabled', name: 'Compensation module', kind: 'boolean', moduleKey: 'compensation' },
+  { key: 'benefits.enabled', name: 'Benefits module', kind: 'boolean', moduleKey: 'benefits' },
+  { key: 'recruitment.enabled', name: 'Recruitment module', kind: 'boolean', moduleKey: 'recruitment' },
+  { key: 'performance.enabled', name: 'Performance module', kind: 'boolean', moduleKey: 'performance' },
+  { key: 'talent.enabled', name: 'Talent module', kind: 'boolean', moduleKey: 'talent' },
+  { key: 'engagement.enabled', name: 'Engagement module', kind: 'boolean', moduleKey: 'engagement' },
+  { key: 'employee_relations.enabled', name: 'Employee relations module', kind: 'boolean', moduleKey: 'employee_relations' },
+  { key: 'lifecycle.enabled', name: 'Onboarding & exit module', kind: 'boolean', moduleKey: 'lifecycle' },
+  { key: 'expenses.enabled', name: 'Expenses module', kind: 'boolean', moduleKey: 'expenses' },
+  { key: 'loans.enabled', name: 'Loans module', kind: 'boolean', moduleKey: 'loans' },
+  { key: 'billing.enabled', name: 'Billing module', kind: 'boolean', moduleKey: 'billing' },
+  { key: 'documents.enabled', name: 'Documents module', kind: 'boolean', moduleKey: 'documents' },
+  { key: 'assets.enabled', name: 'Assets module', kind: 'boolean', moduleKey: 'assets' },
+  { key: 'helpdesk.enabled', name: 'Helpdesk module', kind: 'boolean', moduleKey: 'helpdesk' },
+  { key: 'travel.enabled', name: 'Travel module', kind: 'boolean', moduleKey: 'travel' },
+  { key: 'workforce_planning.enabled', name: 'Workforce planning module', kind: 'boolean', moduleKey: 'workforce_planning' },
+  { key: 'analytics.enabled', name: 'People analytics module', kind: 'boolean', moduleKey: 'analytics' },
+  { key: 'workflow.enabled', name: 'Workflow module', kind: 'boolean', moduleKey: 'workflow' },
+  { key: 'notifications.enabled', name: 'Notifications module', kind: 'boolean', moduleKey: 'notifications' },
+  { key: 'integrations.enabled', name: 'Integrations module', kind: 'boolean', moduleKey: 'integrations' },
+  { key: 'ai_assistant.enabled', name: 'AI assistant module', kind: 'boolean', moduleKey: 'ai_assistant' },
+  { key: 'learning.enabled', name: 'Learning module (LMS)', kind: 'boolean', moduleKey: 'learning' },
+
+  // ---- feature-level switches beneath a module ----
+  { key: 'payroll.statutory.enabled', name: 'PF / ESI / PT / TDS', description: 'Indian statutory computation and returns.', kind: 'boolean', moduleKey: 'payroll' },
+  { key: 'payroll.bank_file.enabled', name: 'Bank file export', description: 'Generate statutory bank upload files.', kind: 'boolean', moduleKey: 'payroll' },
+  { key: 'payroll.payslips.enabled', name: 'Payslips', kind: 'boolean', moduleKey: 'payroll', defaultValue: '1' },
+  { key: 'attendance.biometric.enabled', name: 'Biometric / device sync', kind: 'boolean', moduleKey: 'attendance' },
+  { key: 'attendance.geofence.enabled', name: 'Geo-fenced punches', kind: 'boolean', moduleKey: 'attendance' },
+  { key: 'recruitment.portal.enabled', name: 'Careers portal', kind: 'boolean', moduleKey: 'recruitment' },
+  { key: 'api.enabled', name: 'Public API', description: 'Versioned API keys for external systems.', kind: 'boolean', moduleKey: 'integrations' },
+  { key: 'sso.enabled', name: 'Single sign-on', kind: 'boolean' },
+  { key: 'ai.enabled', name: 'AI assistant', kind: 'boolean', moduleKey: 'ai_assistant' },
+  { key: 'support.white_label.enabled', name: 'White-label login', kind: 'boolean' },
 ];
+
+/**
+ * Plans (spec §7).
+ *
+ * `entitlements` is a complete grant list per plan — there is no fallback that
+ * would let a plan silently inherit another plan's caps, and nothing outside
+ * this file interprets these values. Pricing stays here but is never read by
+ * business logic, only displayed.
+ */
+const PLATFORM_PLANS = [
+  {
+    key: 'trial', name: 'Trial', planType: 'trial', isPublic: true,
+    description: '14-day evaluation with the core people modules.',
+    priceMonthly: 0, trialDays: 14, sortOrder: 10,
+    modules: ['employees', 'attendance', 'leave', 'documents', 'helpdesk', 'analytics'],
+    entitlements: {
+      'employees.max': '25', 'active_users.max': '25', 'admins.max': '3',
+      'locations.max': '1', 'legal_entities.max': '1', 'storage.max_gb': '1',
+      'api_keys.max': '0', 'webhooks.max': '0', 'recruitment.jobs.max': '0', 'documents.stored': '100',
+      'api.requests.month': '0', 'workflow.executions.month': '100', 'payroll_runs.month': '0', 'ai.requests.month': '0',
+      'employees.enabled': '1', 'attendance.enabled': '1', 'leave.enabled': '1', 'documents.enabled': '1',
+      'helpdesk.enabled': '1', 'analytics.enabled': '1', 'notifications.enabled': '1',
+      'payroll.enabled': '0', 'travel.enabled': '0', 'ai.enabled': '0', 'api.enabled': '0',
+      'sso.enabled': '0', 'integrations.enabled': '0', 'ai_assistant.enabled': '0',
+    },
+  },
+  {
+    key: 'starter', name: 'Starter', planType: 'standard', isPublic: true,
+    description: 'Core HR for a single-site team up to 100 employees.',
+    priceMonthly: 4999, sortOrder: 20,
+    modules: ['employees', 'attendance', 'leave', 'timesheets', 'documents', 'expenses', 'lifecycle',
+      'helpdesk', 'assets', 'analytics', 'notifications', 'workflow'],
+    entitlements: {
+      'employees.max': '100', 'active_users.max': '100', 'admins.max': '3',
+      'locations.max': '2', 'legal_entities.max': '1', 'storage.max_gb': '10',
+      'api_keys.max': '1', 'webhooks.max': '0', 'recruitment.jobs.max': '5', 'documents.stored': '1000',
+      'api.requests.month': '10000', 'workflow.executions.month': '1000', 'payroll_runs.month': '0', 'ai.requests.month': '0',
+      'employees.enabled': '1', 'attendance.enabled': '1', 'leave.enabled': '1', 'timesheets.enabled': '1',
+      'documents.enabled': '1', 'expenses.enabled': '1', 'lifecycle.enabled': '1', 'helpdesk.enabled': '1',
+      'assets.enabled': '1', 'analytics.enabled': '1', 'notifications.enabled': '1', 'workflow.enabled': '1',
+      'payroll.enabled': '0', 'compensation.enabled': '0', 'benefits.enabled': '0',
+      'recruitment.enabled': '0', 'performance.enabled': '0', 'talent.enabled': '0',
+      'engagement.enabled': '0', 'employee_relations.enabled': '0', 'loans.enabled': '0', 'billing.enabled': '0',
+      'travel.enabled': '0', 'workforce_planning.enabled': '0', 'integrations.enabled': '0',
+      'ai.enabled': '0', 'ai_assistant.enabled': '0', 'api.enabled': '0', 'sso.enabled': '0',
+      'support.white_label.enabled': '0',
+    },
+  },
+  {
+    key: 'growth', name: 'Growth', planType: 'standard', isPublic: true,
+    description: 'Full people operations including payroll and hiring.',
+    priceMonthly: 11999, sortOrder: 30,
+    modules: null,
+    entitlements: {
+      'employees.max': '250', 'active_users.max': '250', 'admins.max': '10',
+      'locations.max': '5', 'legal_entities.max': '3', 'storage.max_gb': '50',
+      'api_keys.max': '3', 'webhooks.max': '5', 'recruitment.jobs.max': '25', 'documents.stored': '5000',
+      'api.requests.month': '50000', 'workflow.executions.month': '5000', 'payroll_runs.month': '4', 'ai.requests.month': '0',
+      'employees.enabled': '1', 'attendance.enabled': '1', 'leave.enabled': '1', 'timesheets.enabled': '1',
+      'documents.enabled': '1', 'expenses.enabled': '1', 'lifecycle.enabled': '1', 'helpdesk.enabled': '1',
+      'assets.enabled': '1', 'analytics.enabled': '1', 'notifications.enabled': '1', 'workflow.enabled': '1',
+      'payroll.enabled': '1', 'payroll.statutory.enabled': '1', 'payroll.payslips.enabled': '1', 'payroll.bank_file.enabled': '1',
+      'compensation.enabled': '1', 'benefits.enabled': '1',
+      'recruitment.enabled': '1', 'performance.enabled': '1', 'talent.enabled': '1',
+      'engagement.enabled': '1', 'employee_relations.enabled': '1', 'loans.enabled': '1', 'billing.enabled': '1',
+      'travel.enabled': '0', 'workforce_planning.enabled': '0', 'integrations.enabled': '0',
+      'ai.enabled': '0', 'ai_assistant.enabled': '0', 'api.enabled': '0', 'sso.enabled': '0',
+      'support.white_label.enabled': '1',
+    },
+  },
+  {
+    key: 'business', name: 'Business', planType: 'premium', isPublic: true,
+    description: 'Multi-entity payroll, integrations, analytics and AI.',
+    priceMonthly: 24999, sortOrder: 40,
+    modules: null,
+    entitlements: {
+      'employees.max': '500', 'active_users.max': '500', 'admins.max': '25',
+      'locations.max': '10', 'legal_entities.max': '10', 'storage.max_gb': '100',
+      'api_keys.max': '10', 'webhooks.max': '25', 'recruitment.jobs.max': '100', 'documents.stored': '20000',
+      'api.requests.month': '100000', 'workflow.executions.month': '10000', 'payroll_runs.month': '6', 'ai.requests.month': '1000',
+      'employees.enabled': '1', 'attendance.enabled': '1', 'leave.enabled': '1', 'timesheets.enabled': '1',
+      'documents.enabled': '1', 'expenses.enabled': '1', 'lifecycle.enabled': '1', 'helpdesk.enabled': '1',
+      'assets.enabled': '1', 'analytics.enabled': '1', 'notifications.enabled': '1', 'workflow.enabled': '1',
+      'payroll.enabled': '1', 'payroll.statutory.enabled': '1', 'payroll.payslips.enabled': '1', 'payroll.bank_file.enabled': '1',
+      'compensation.enabled': '1', 'benefits.enabled': '1',
+      'recruitment.enabled': '1', 'recruitment.portal.enabled': '1',
+      'performance.enabled': '1', 'talent.enabled': '1', 'engagement.enabled': '1',
+      'employee_relations.enabled': '1', 'loans.enabled': '1', 'billing.enabled': '1',
+      'travel.enabled': '1', 'workforce_planning.enabled': '1',
+      'integrations.enabled': '1', 'api.enabled': '1',
+      'ai.enabled': '1', 'ai_assistant.enabled': '1', 'sso.enabled': '0',
+      'support.white_label.enabled': '1',
+    },
+  },
+  {
+    key: 'enterprise', name: 'Enterprise', planType: 'premium', isPublic: true,
+    description: 'Unlimited entities, SSO, dedicated support and white labelling.',
+    priceMonthly: 64999, sortOrder: 50,
+    modules: null,
+    entitlements: {
+      'employees.max': '2000', 'active_users.max': '2000', 'admins.max': '100',
+      'locations.max': '50', 'legal_entities.max': '50', 'storage.max_gb': '500',
+      'api_keys.max': '50', 'webhooks.max': '100', 'recruitment.jobs.max': '500', 'documents.stored': '100000',
+      'api.requests.month': '1000000', 'workflow.executions.month': '50000', 'payroll_runs.month': '12', 'ai.requests.month': '10000',
+      'employees.enabled': '1', 'attendance.enabled': '1', 'leave.enabled': '1', 'timesheets.enabled': '1',
+      'documents.enabled': '1', 'expenses.enabled': '1', 'lifecycle.enabled': '1', 'helpdesk.enabled': '1',
+      'assets.enabled': '1', 'analytics.enabled': '1', 'notifications.enabled': '1', 'workflow.enabled': '1',
+      'payroll.enabled': '1', 'payroll.statutory.enabled': '1', 'payroll.payslips.enabled': '1', 'payroll.bank_file.enabled': '1',
+      'compensation.enabled': '1', 'benefits.enabled': '1',
+      'recruitment.enabled': '1', 'recruitment.portal.enabled': '1',
+      'performance.enabled': '1', 'talent.enabled': '1', 'engagement.enabled': '1',
+      'employee_relations.enabled': '1', 'loans.enabled': '1', 'billing.enabled': '1',
+      'travel.enabled': '1', 'workforce_planning.enabled': '1', 'learning.enabled': '1',
+      'integrations.enabled': '1', 'api.enabled': '1',
+      'ai.enabled': '1', 'ai_assistant.enabled': '1', 'sso.enabled': '1',
+      'attendance.biometric.enabled': '1', 'attendance.geofence.enabled': '1',
+      'support.white_label.enabled': '1',
+    },
+  },
+  {
+    key: 'custom', name: 'Custom', planType: 'custom', isPublic: true,
+    description: 'Negotiated limits. Granted per tenant through overrides.',
+    priceMonthly: 0, sortOrder: 60,
+    modules: null,
+    entitlements: {
+      'employees.max': '500', 'active_users.max': '500', 'admins.max': '25',
+      'locations.max': '10', 'legal_entities.max': '10', 'storage.max_gb': '100',
+      'api_keys.max': '10', 'webhooks.max': '25', 'recruitment.jobs.max': '100', 'documents.stored': '20000',
+      'api.requests.month': '100000', 'workflow.executions.month': '10000', 'payroll_runs.month': '6', 'ai.requests.month': '1000',
+      'employees.enabled': '1', 'attendance.enabled': '1', 'leave.enabled': '1',
+      'documents.enabled': '1', 'payroll.enabled': '1', 'analytics.enabled': '1',
+      'travel.enabled': '0', 'ai.enabled': '0', 'api.enabled': '0', 'sso.enabled': '0',
+    },
+  },
+];
+
+/**
+ * Plan keys that earlier releases used, mapped onto the current catalogue so an
+ * existing tenant keeps a resolvable plan instead of silently resolving nothing.
+ */
+const LEGACY_PLAN_ALIASES = { standard: 'growth', professional: 'business', basic: 'starter', pro: 'business' };
+
+/** Subscription states (spec §26) and what they mean for entitlement resolution. */
+const SUBSCRIPTION_STATUSES = ['trialing', 'active', 'past_due', 'grace_period', 'suspended', 'cancelled', 'expired'];
+/** Tenant lifecycle states (spec §27). */
+const TENANT_STATUSES = ['provisioning', 'trial', 'active', 'past_due', 'grace_period', 'suspended', 'cancelled', 'archived', 'deletion_pending', 'deleted'];
+
+/**
+ * Which lifecycle states may still transact.
+ *
+ * A tenant suspended for non-payment keeps *read* access to its history — locking
+ * a company out of its own payroll records would be hostile and would not make
+ * anyone pay — but it may not create anything new (spec §15).
+ */
+const TENANT_READ_ONLY_STATUSES = new Set(['suspended', 'cancelled', 'archived', 'deletion_pending', 'deleted', 'provisioning']);
+const TENANT_BLOCKED_STATUSES = new Set(['deleted']);
+
+/** Roles that exist at the platform layer rather than inside a customer company. */
+const PLATFORM_ROLE_KEYS = ['platform_super_admin', 'platform_billing_admin', 'platform_support_admin', 'platform_security_admin', 'platform_auditor'];
 
 const DEFAULT_ROLES = ['company_owner', 'hr_admin', 'payroll_admin', 'finance_admin', 'manager', 'recruiter', 'department_head', 'employee', 'auditor'];
 
@@ -686,7 +1022,9 @@ const hasScope = (perms, base, needed) => {
 module.exports = {
   PERMISSIONS, PERMISSION_CATALOG, PERMISSION_ALIASES, REVERSE_ALIASES, aliasCandidates, modernEquivalents,
   SCOPES, SCOPE_RANK, SCOPEABLE_BASES, MODULE_LABELS, ACTION_LABELS, humanize,
-  ROLE_DEFS, DEFAULT_ROLES, hasPerm, hasScope, allowedScopes, widestScope,
-  SYSTEM_PERMISSION_GROUPS, MODULE_CATALOG, MODULE_PERMISSION_MODULES, SYSTEM_RELATIONSHIP_TYPES,
-  DEFAULT_SECURITY_POLICIES, PLATFORM_PLANS,
+  ROLE_DEFS, DEFAULT_ROLES, PLATFORM_ROLE_KEYS, PLATFORM_PERMISSIONS, hasPerm, hasScope, allowedScopes, widestScope,
+  SYSTEM_PERMISSION_GROUPS, MODULE_CATALOG, MODULE_PERMISSION_MODULES, MODULE_DEPENDENCIES, moduleDependencies,
+  SYSTEM_RELATIONSHIP_TYPES, DEFAULT_SECURITY_POLICIES,
+  PLATFORM_PLANS, LEGACY_PLAN_ALIASES, ENTITLEMENT_CATALOG,
+  SUBSCRIPTION_STATUSES, TENANT_STATUSES, TENANT_READ_ONLY_STATUSES, TENANT_BLOCKED_STATUSES,
 };

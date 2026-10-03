@@ -114,7 +114,7 @@ r.get('/menus', requirePermission('administration.modules.view', { anyOf: ['sett
   const items = decode(rows, []).map((m) => ({
     ...m,
     accessible: m.required_permission
-      ? (req.user.isPlatformAdmin || req.user.permissions.includes(m.required_permission))
+      ? (req.user.isPlatformSuperAdmin || req.user.permissions.includes(m.required_permission))
       : true,
   }));
   const byParent = new Map();
@@ -158,7 +158,7 @@ r.get('/dashboard-widgets', requirePermission('administration.dashboard.view', {
   const data = decode(rows, ['config']).map((w) => ({
     ...w,
     accessible: w.required_permission
-      ? (req.user.isPlatformAdmin || req.user.permissions.includes(w.required_permission))
+      ? (req.user.isPlatformSuperAdmin || req.user.permissions.includes(w.required_permission))
       : true,
   }));
   res.json({ data });
@@ -481,10 +481,10 @@ r.post('/config/versions/:id/rollback', requirePermission('administration.config
   const version = Number(v || 0) + 1;
   const [ins] = await pool.query(
     `INSERT INTO config_versions (tenant_id, config_key, module, version, status, config, notes, effective_from, created_by)
-     VALUES (?,?,?,?, 'published', ?, ?, NOW(), ?)`,
+     VALUES (?,?,?,?, 'active', ?, ?, NOW(), ?)`,
     [t, rows[0].config_key, rows[0].module, version, j(snapshot), `Rollback to version ${rows[0].version}`, req.user.id]
   );
-  await pool.query("UPDATE config_versions SET status = 'superseded' WHERE tenant_id = ? AND config_key = ? AND status = 'published'", [t, rows[0].config_key]);
+  await pool.query("UPDATE config_versions SET status = 'expired', effective_to = CURDATE() WHERE tenant_id = ? AND config_key = ? AND status = 'active' AND id <> ?", [t, rows[0].config_key, ins.insertId]);
   await audit(req, { action: 'config.version.rollback', entityType: 'config', entityId: ins.insertId, before: rows[0], after: { rolledBackTo: rows[0].version, version } });
   res.json({ ok: true, data: { version, config: snapshot } });
 }));

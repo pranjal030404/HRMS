@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../auth';
 import { api, fmtDate } from '../api';
+import SupportAccessBanner from './SupportAccessBanner';
 
 const I = {
   dash: <path d="M3 12l9-8 9 8M5 10v10h5v-6h4v6h5V10" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />,
@@ -145,6 +146,7 @@ export default function Layout() {
     {
       label: 'System', items: [
         { to: '/security', icon: I.shield, label: 'My Security', show: true },
+        { to: '/account', icon: I.chart, label: 'Plan & billing', show: can('settings.manage') },
         { to: '/settings', icon: I.gear, label: 'Settings', show: can('settings.view') || can('user.manage') },
         {
           to: '/administration',
@@ -232,6 +234,9 @@ export default function Layout() {
           </div>
         </header>
         <div className="content page-enter" key={loc.pathname}>
+          {/* Only renders for a platform operator with a live session — a tenant
+              user has nothing to be reminded about. */}
+          <SupportAccessBanner />
           <Outlet />
         </div>
       </div>

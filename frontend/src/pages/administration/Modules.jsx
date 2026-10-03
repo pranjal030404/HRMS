@@ -13,8 +13,15 @@ export default function AdminModules() {
   );
 }
 
+const WHY = {
+  excluded: 'Not included in this company’s plan',
+  suspended: 'The company is not in a paying state, so modules are unavailable',
+  limit: 'A usage limit on this capability has been reached',
+  unknown: 'Ask ARTHVEX to enable this capability',
+};
+
 function Modules() {
-  const { can, refreshMe } = useAuth();
+  const { can, refreshMe, entitlement, me } = useAuth();
   const toast = useToast();
   const [tab, setTab] = useState('modules');
   const { data, loading, reload } = useLoader(listLoader('/administration/modules'), []);
@@ -57,6 +64,14 @@ function Modules() {
         actions={<button className="btn secondary sm" onClick={() => reload()}>Refresh</button>}
       />
 
+      {me?.tenantReadOnly && (
+        <div className="banner warn mb">
+          This company is <strong>{String(me.tenantStatus || 'not active').replace(/_/g, ' ')}</strong>. It is
+          read-only: everything still displays and exports, but every write is refused by the server.
+          Modules below show what will be available again once it is reactivated.
+        </div>
+      )}
+
       <Tabs
         tabs={[
           { key: 'modules', label: 'Modules' },
@@ -80,7 +95,7 @@ function Modules() {
                 </div>
                 <div className="table-wrap">
                   <table className="tbl">
-                    <thead><tr><th>Module</th><th>Description</th><th>State</th><th>Updated</th><th></th></tr></thead>
+                    <thead><tr><th>Module</th><th>Description</th><th>On the plan</th><th>State</th><th>Updated</th><th></th></tr></thead>
                     <tbody>
                       {mods.map((m) => (
                         <tr key={m.key}>
@@ -92,12 +107,32 @@ function Modules() {
                             {m.description || '—'}
                             {!m.defaultEnabled && <div><span className="badge gray">off by default</span></div>}
                           </td>
-                          <td>{m.enabled ? <span className="badge green">Enabled</span> : <span className="badge gray">Disabled</span>}</td>
+                          {/* Entitlement and configuration are different questions.
+                              A module can be switched on locally and still be refused
+                              because the plan does not include it, so both are shown. */}
+                          <td>
+                            <PlanState state={entitlement(`${m.key}.enabled`)} />
+                          </td>
+                          <td>
+                            {m.enabled ? <span className="badge green">Enabled</span> : <span className="badge gray">Disabled</span>}
+                            {!m.enabled && entitlement(`${m.key}.enabled`).state !== 'on' && (
+                              <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 3, maxWidth: 200 }}>
+                                {WHY[entitlement(`${m.key}.enabled`).state] || 'Not available'}
+                              </div>
+                            )}
+                          </td>
                           <td style={{ fontSize: 12.5 }}>{m.updatedAt ? fmtDate(m.updatedAt, true) : '—'}</td>
                           <td className="actions">
                             {canManage && (
                               <>
-                                <Toggle checked={m.enabled} disabled={busy === m.key} onChange={(v) => flip(m, v)} label={`Toggle ${m.name}`} />
+                                {/* A switch that is not entitled cannot be turned on, so it
+                                    is disabled rather than letting the server 402 it. */}
+                                <Toggle
+                                  checked={m.enabled}
+                                  disabled={busy === m.key || entitlement(`${m.key}.enabled`).state !== 'on'}
+                                  onChange={(v) => flip(m, v)}
+                                  label={`Toggle ${m.name}`}
+                                />
                                 {m.enabled !== m.defaultEnabled && (
                                   <button className="btn ghost sm" onClick={() => setResetting(m)}>Reset</button>
                                 )}
@@ -128,6 +163,20 @@ function Modules() {
       )}
     </div>
   );
+}
+
+/** What the plan says about one capability, in the server's own vocabulary. */
+function PlanState({ state }) {
+  const map = {
+    on: ['green', 'Included'],
+    off: ['gray', 'Not included'],
+    excluded: ['gray', 'Not included'],
+    suspended: ['amber', 'Unavailable'],
+    limit: ['amber', 'Limit reached'],
+    unknown: ['gray', 'Unknown'],
+  };
+  const [color, label] = map[state] || map.unknown;
+  return <span className={'badge ' + color}>{label}</span>;
 }
 
 /** Navigation entries and the permission each one needs. */
